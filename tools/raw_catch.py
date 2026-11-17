@@ -46,7 +46,9 @@ def main():
     time.sleep(3.0)
 
     print(">> POWER OFF"); print("   ", power("OFF"))
-    time.sleep(2.0)
+    off_gap = float(os.environ.get("OFF_DELAY", "3.0"))
+    print(">> (holding OFF %.1fs to drain caps)" % off_gap)
+    time.sleep(off_gap)
     print(">> POWER ON");  print("   ", power("ON"))
 
     end = time.time() + 24

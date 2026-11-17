@@ -20,10 +20,10 @@
 // ============================================================================
 
 #include <Arduino.h>
-#include <BLEDevice.h>
-#include <BLEUtils.h>
-#include <BLEServer.h>
-#include <BLEBeacon.h>
+#include <NimBLEDevice.h>
+#include <NimBLEAdvertising.h>
+#include <NimBLEScan.h>
+#include <NimBLEAdvertisedDevice.h>
 #include <Preferences.h>
 #include <string>
 #include <vector>
@@ -63,8 +63,8 @@ const std::vector<LightType> lightTypes = {
 
 uint8_t my_key[4] = { 0, 0, 0, 0 };
 std::vector<LightDevice> myLights;
-BLEAdvertising* pAdvertising = nullptr;
-BLEScan* pBLEScan = nullptr;
+NimBLEAdvertising* pAdvertising = nullptr;
+NimBLEScan* pBLEScan = nullptr;
 Preferences prefs;
 
 bool scanRequested = false;
@@ -91,6 +91,7 @@ void cmd_rgb(uint8_t n, uint8_t r, uint8_t g, uint8_t b);
 void createLightEntity(LightDevice &l);
 void scan();
 void rawScan(int seconds = 5);
+void rawScanPassive(int seconds = 5);
 void wakeFor(int seconds);
 void wakePhone(int seconds);
 void addLight(uint8_t number, LightDevice &l);
@@ -98,6 +99,7 @@ void addLights();
 void loadConfig();
 void saveLights();
 void loadLights();
+void readdLight(const std::string &mac, uint8_t number);
 void printHelp();
 void handleCommand(char* line);
 void serialConsole();
@@ -128,18 +130,26 @@ uint8_t firstLightNumber() {
 // ============================================================================
 //  Control frames (shared by HA callbacks and the serial console)
 // ============================================================================
+// Build + arm one FastCon manufacturer advertisement on pAdvertising. `sd` is
+// the raw AD structure from protocol::to_adv_data(): [len] 0xFF 0xF0 0xFF <payload>.
+// NimBLEAdvertisementData::addData() appends raw bytes verbatim (identical to the
+// old Bluedroid addData), so the on-air bytes match the proven build exactly.
+void armMfgAdvertise(const std::string &sd) {
+  NimBLEAdvertisementData ad;
+  ad.setFlags(0x04);   // BLE_HS_ADV_F_BREDR_UNSUP
+  ad.addData((const uint8_t *)sd.data(), sd.size());
+  pAdvertising->setAdvertisementData(ad);
+  pAdvertising->setMinInterval(50);
+  pAdvertising->setMaxInterval(50);
+}
+
 void single_control(const uint8_t key[4], const uint8_t data[8]) {
   std::vector<uint8_t> rf =
       protocol::generate_command(protocol::CONTROL,
                                  std::vector<uint8_t>(data, data + 8), key, true);
   std::string sd = protocol::to_adv_data(rf);
 
-  BLEAdvertisementData ad = BLEAdvertisementData();
-  ad.setFlags(0x04);              // BR_EDR_NOT_SUPPORTED
-  ad.addData((char*)sd.data(), (size_t)sd.size());
-  pAdvertising->setAdvertisementData(ad);
-  pAdvertising->setMinInterval(50);
-  pAdvertising->setMaxInterval(50);
+  armMfgAdvertise(sd);
   pAdvertising->start();
   delay(250);
   pAdvertising->stop();
@@ -249,13 +259,11 @@ void createLightEntity(LightDevice &l) {
 // ============================================================================
 //  Discovery callbacks
 // ============================================================================
-class AddDeviceCallback : public BLEAdvertisedDeviceCallbacks {
+class AddDeviceCallback : public NimBLEScanCallbacks {
  public:
-  void onResult(BLEAdvertisedDevice dev) {
-    String addressS = dev.getAddress().toString();
-    std::string address = addressS.c_str();
-    String mfgS = dev.getManufacturerData();
-    std::string mfg = mfgS.c_str();
+  void onResult(const NimBLEAdvertisedDevice *dev) {
+    std::string address = dev->getAddress().toString();
+    std::string mfg = dev->getManufacturerData();
     if (mfg.size() != 18) return;
 
     std::string type = mfg.substr(12, 2);
@@ -285,13 +293,11 @@ class AddDeviceCallback : public BLEAdvertisedDeviceCallbacks {
   }
 };
 
-class AddLightCallback : public BLEAdvertisedDeviceCallbacks {
+class AddLightCallback : public NimBLEScanCallbacks {
  public:
-  void onResult(BLEAdvertisedDevice dev) {
-    String addressS = dev.getAddress().toString();
-    std::string address = addressS.c_str();
-    String mfgS = dev.getManufacturerData();
-    std::string mfg = mfgS.c_str();
+  void onResult(const NimBLEAdvertisedDevice *dev) {
+    std::string address = dev->getAddress().toString();
+    std::string mfg = dev->getManufacturerData();
     if (mfg.size() != 18) return;
 
     for (auto &l : myLights) {
@@ -324,33 +330,96 @@ class AddLightCallback : public BLEAdvertisedDeviceCallbacks {
 //  Debug: unfiltered scan - dump EVERY advertiser's manufacturer data
 //  (lets us see a bulb's real advertising key without assuming factory key)
 // ============================================================================
-class RawScanCallback : public BLEAdvertisedDeviceCallbacks {
+class RawScanCallback : public NimBLEScanCallbacks {
  public:
-  void onResult(BLEAdvertisedDevice dev) {
-    String addrS = dev.getAddress().toString();
-    String mfgS = dev.getManufacturerData();
+  void onResult(const NimBLEAdvertisedDevice *dev) {
+    std::string addr = dev->getAddress().toString();
+    std::string mfgS = dev->getManufacturerData();
     if (mfgS.length() > 0) {
-      Serial.printf("RAW %s mfg(%d): ", addrS.c_str(), (int)mfgS.length());
-      for (int i = 0; i < (int)mfgS.length(); i++) Serial.printf("%02X ", (uint8_t)mfgS[i]);
+      Serial.printf("RAW %s mfg(%d): ", addr.c_str(), (int)mfgS.length());
+      for (size_t i = 0; i < mfgS.length(); i++) Serial.printf("%02X ", (uint8_t)mfgS[i]);
       Serial.println();
     } else {
-      Serial.printf("RAW %s (no mfg data)\n", addrS.c_str());
+      Serial.printf("RAW %s (no mfg data)\n", addr.c_str());
     }
   }
 };
 
+// NimBLE's start() is NON-BLOCKING (unlike Bluedroid's) and takes duration in
+// MILLISECONDS. The discovery / SET_KEY recipe must hold WAKE / SET_KEY advertising
+// up for the whole scan window, so those paths poll until the scan finishes; the
+// long raw dumps run in the background so 'scanstop' can cut them short.
+static void waitScanDone(uint32_t timeoutMs) {
+  uint32_t t0 = millis();
+  while (pBLEScan && pBLEScan->isScanning()) {
+    if ((uint32_t)(millis() - t0) > timeoutMs) break;   // hard cap; scan self-terminates too
+    delay(50);
+  }
+}
+
+// NimBLE's ESP32 controller DROPS the advertiser the moment a scan starts, so the
+// Bluedroid-style "advertise WAKE + scan concurrently" isn't available on this stack.
+// Instead we time-slice: put the payload (WAKE / SET_KEY) on the air for advMs, then
+// listen for scanMs, and repeat. The WAKE keeps re-appearing between scan windows, so
+// the woken bulb's identity frames land during one of our scan windows. (Same
+// start/delay/stop rhythm that wakePhone() already relies on to fire reliably.)
+void slicedAdvertiseScan(int totalSec, int advMs, int scanMs,
+                         NimBLEScanCallbacks *cb, bool active) {
+  uint32_t target = (uint32_t)totalSec * 1000;
+  uint32_t t0 = millis();
+  int cycles = 0;
+  while ((uint32_t)(millis() - t0) < target) {
+    // 1) payload on the air (WAKE / SET_KEY)
+    if (!pAdvertising->isAdvertising()) pAdvertising->start();
+    delay(advMs);
+    pAdvertising->stop();
+    delay(20);                     // let the controller release the radio before scanning
+    // 2) listen (advertiser is down, so the scan owns the radio)
+    pBLEScan = NimBLEDevice::getScan();
+    pBLEScan->setScanCallbacks(cb, true);   // wantDuplicates = true (see rawScan notes)
+    pBLEScan->setDuplicateFilter(0);
+    pBLEScan->setInterval(300);
+    pBLEScan->setWindow(300);
+    pBLEScan->setActiveScan(active);
+    pBLEScan->start(scanMs, false, false);
+    delay(50);                     // let the scan actually begin (host task is async)
+    waitScanDone((uint32_t)scanMs + 200);
+    cycles++;
+  }
+  pAdvertising->stop();
+  Serial.printf("  [sliced: %d WAKE/scan cycles]\n", cycles);
+}
+
 void rawScan(int seconds) {
   pAdvertising->stop();
-  Serial.printf("RAW scan (%ds): every advertiser, unfiltered\n", seconds);
-  pBLEScan = BLEDevice::getScan();
+  Serial.printf("RAW scan STARTING (~%ds; send 'scanstop' to end early): every advertiser, unfiltered\n", seconds);
+  pBLEScan = NimBLEDevice::getScan();
   // wantDuplicates = true: fire onResult for EVERY frame (no per-address dedup),
   // so we see all of a bulb's advertisement types across its short boot window.
-  pBLEScan->setAdvertisedDeviceCallbacks(new RawScanCallback(), true);
+  pBLEScan->setScanCallbacks(new RawScanCallback(), true);
+  pBLEScan->setDuplicateFilter(0);        // explicit: also drop the controller-level dup filter
   pBLEScan->setInterval(300);
   pBLEScan->setWindow(300);
   pBLEScan->setActiveScan(true);
-  pBLEScan->start(seconds, false);
-  Serial.println("RAW scan done");
+  pBLEScan->start(seconds * 1000, false, false);   // duration is MILLISECONDS; non-blocking
+  Serial.println("  (scan runs in the background; ends on its own or with 'scanstop')");
+}
+
+// Passive raw scan: PURE listening (no SCAN_REQ) at 100% duty, wantDuplicates.
+// Best for catching a phone's ONE-SHOT FastCon broadcast (e.g. the app's
+// "Forget/Reset"): active scan's SCAN_REQ transmissions steal RX time, so passive
+// listens the whole of each channel slot and drops fewer one-shots.
+void rawScanPassive(int seconds) {
+  pAdvertising->stop();
+  Serial.printf("RAW+PASSIVE (%ds): pure listening, every frame, no SCAN_REQ\n", seconds);
+  pBLEScan = NimBLEDevice::getScan();
+  pBLEScan->setScanCallbacks(new RawScanCallback(), true);
+  pBLEScan->setDuplicateFilter(0);
+  pBLEScan->setInterval(300);
+  pBLEScan->setWindow(300);
+  pBLEScan->setActiveScan(false);
+  pBLEScan->start(seconds * 1000, false, false);   // duration is MILLISECONDS; non-blocking
+  Serial.println("  (scan runs in the background; ends on its own or with 'scanstop')");
 }
 
 // WAKE broadcast + duplicate raw scan: tests whether a WAKE triggers the
@@ -363,22 +432,10 @@ void rawWake(int seconds) {
       protocol::generate_command(protocol::WAKE, std::vector<uint8_t>(data, data + 6), key, false);
   std::string sd = protocol::to_adv_data(rf);
 
-  BLEAdvertisementData ad = BLEAdvertisementData();
-  ad.setFlags(0x04);
-  ad.addData((char*)sd.data(), (size_t)sd.size());
-  pAdvertising->setAdvertisementData(ad);
-  pAdvertising->setMinInterval(50);
-  pAdvertising->setMaxInterval(50);
+  armMfgAdvertise(sd);
 
-  Serial.printf("RAW+WAKE (%ds): broadcasting WAKE + capturing every frame\n", seconds);
-  pAdvertising->start();
-  pBLEScan = BLEDevice::getScan();
-  pBLEScan->setAdvertisedDeviceCallbacks(new RawScanCallback(), true);
-  pBLEScan->setInterval(300);
-  pBLEScan->setWindow(300);
-  pBLEScan->setActiveScan(true);
-  pBLEScan->start(seconds, false);
-  pAdvertising->stop();
+  Serial.printf("RAW+WAKE (%ds): time-sliced WAKE + raw scan (every frame)\n", seconds);
+  slicedAdvertiseScan(seconds, 300, 150, new RawScanCallback(), true);
   Serial.println("RAW+WAKE done");
 }
 
@@ -390,12 +447,7 @@ void wakeFor(int seconds) {
   std::vector<uint8_t> rf =
       protocol::generate_command(protocol::WAKE, std::vector<uint8_t>(data, data + 6), key, false);
   std::string sd = protocol::to_adv_data(rf);
-  BLEAdvertisementData ad = BLEAdvertisementData();
-  ad.setFlags(0x04);
-  ad.addData((char*)sd.data(), (size_t)sd.size());
-  pAdvertising->setAdvertisementData(ad);
-  pAdvertising->setMinInterval(50);
-  pAdvertising->setMaxInterval(50);
+  armMfgAdvertise(sd);
   Serial.printf("Broadcasting WAKE for %ds (no scan)...\n", seconds);
   pAdvertising->start();
   delay(seconds * 1000);
@@ -426,12 +478,7 @@ void wakePhone(int seconds) {
     sd += (char)0xF0;
     sd += (char)0xFF;                   // company 0xFFF0
     for (auto b : payload) sd += (char)b;
-    BLEAdvertisementData ad = BLEAdvertisementData();
-    ad.setFlags(0x04);
-    ad.addData((char*)sd.data(), (size_t)sd.size());
-    pAdvertising->setAdvertisementData(ad);
-    pAdvertising->setMinInterval(50);
-    pAdvertising->setMaxInterval(50);
+    armMfgAdvertise(sd);
     pAdvertising->start();
     delay(roundMs);
     pAdvertising->stop();
@@ -453,27 +500,13 @@ void scan(int seconds) {
       protocol::generate_command(protocol::WAKE, std::vector<uint8_t>(data, data + 6), key, false);
   std::string sd = protocol::to_adv_data(rf);
 
-  BLEAdvertisementData ad = BLEAdvertisementData();
-  ad.setFlags(0x04);
-  ad.addData((char*)sd.data(), (size_t)sd.size());
-  pAdvertising->setAdvertisementData(ad);
-  pAdvertising->setMinInterval(50);
-  pAdvertising->setMaxInterval(50);
+  armMfgAdvertise(sd);
 
-  // Keep the WAKE broadcasting THROUGH the scan (reference does exactly this):
-  // the bulb stays woken and keeps advertising its factory frame while the same
-  // radio time-shares between our TX (WAKE) and RX (scan).
-  pAdvertising->start();
-  pBLEScan = BLEDevice::getScan();
-  // wantDuplicates = true: the bulb interleaves bare beacons (no mfg) with its
-  // factory-identity frame while woken. Without this the per-address dedup locks
-  // onto the first (bare) beacon and we never see the 18-byte identity frame.
-  pBLEScan->setAdvertisedDeviceCallbacks(new AddDeviceCallback(), true);
-  pBLEScan->setInterval(500);
-  pBLEScan->setWindow(500);
-  pBLEScan->setActiveScan(true);
-  pBLEScan->start(seconds, false);
-  pAdvertising->stop();
+  // Bluedroid kept WAKE up THROUGH the scan; NimBLE can't (scan drops the advertiser),
+  // so we time-slice WAKE + scan instead. wantDuplicates=true (set inside the helper)
+  // matters here: the bulb interleaves bare beacons with its factory-identity frame,
+  // and without it the per-address dedup locks onto the first (bare) beacon.
+  slicedAdvertiseScan(seconds, 400, 200, new AddDeviceCallback(), true);
   Serial.println("Discovery complete");
 }
 
@@ -499,23 +532,10 @@ void addLight(uint8_t number, LightDevice &light) {
                                  protocol::DEFAULT_KEY, false);
   std::string sd = protocol::to_adv_data(rf);
 
-  BLEAdvertisementData ad = BLEAdvertisementData();
-  ad.setFlags(0x04);
-  ad.addData((char*)sd.data(), (size_t)sd.size());
-  pAdvertising->setAdvertisementData(ad);
-  pAdvertising->setMinInterval(50);
-  pAdvertising->setMaxInterval(50);
-  pAdvertising->start();
-
-  pBLEScan = BLEDevice::getScan();
-  // Duplicates: same bare-beacon vs identity-frame interleaving as discovery -
-  // we must see the keyed-identity frame even if a bare beacon arrives first.
-  pBLEScan->setAdvertisedDeviceCallbacks(new AddLightCallback(), true);
-  pBLEScan->setInterval(50);
-  pBLEScan->setWindow(50);
-  pBLEScan->setActiveScan(true);
-  pBLEScan->start(1);
-  pAdvertising->stop();
+  armMfgAdvertise(sd);
+  // SET_KEY on the air for ~2 s, time-sliced with the confirmation scan so the
+  // keyed-identity frame lands even though it's interleaved with bare beacons.
+  slicedAdvertiseScan(2, 300, 150, new AddLightCallback(), true);
 }
 
 void addLights() {
@@ -528,6 +548,24 @@ void addLights() {
     maxNum++;
     addLight(maxNum, l);
   }
+}
+
+// End a running (background) raw scan on demand. Only meaningful while a scan is
+// active; harmless (no-op) otherwise.
+void scanStop() {
+  if (pBLEScan && pBLEScan->isScanning()) { pBLEScan->stop(); Serial.println("scanstop: scan stopped"); }
+  else Serial.println("scanstop: no active scan");
+  pAdvertising->stop();
+}
+
+// Parse "aa:bb:cc:dd:ee:ff" into 6 bytes in standard order.
+static bool parseMac(const std::string &s, uint8_t out[6]) {
+  if (s.size() != 17) return false;   // "aa:bb:cc:dd:ee:ff"
+  for (int i = 0; i < 6; i++) {
+    if (i && s[3 * i - 1] != ':') return false;   // colon at 2,5,8,11,14
+    out[i] = (uint8_t)strtoul(s.substr(3 * i, 2).c_str(), nullptr, 16);   // pair at 3*i
+  }
+  return true;
 }
 
 // ============================================================================
@@ -543,7 +581,7 @@ void loadConfig() {
     my_key[1] = (rk >> 8) & 0xFF;
     my_key[2] = (rk >> 16) & 0xFF;
     my_key[3] = (rk >> 24) & 0xFF;
-    prefs.begin("brmesh", true);
+    prefs.begin("brmesh", false);
     prefs.putBytes("key", my_key, 4);
     Serial.println("Generated a NEW mesh key and saved it");
   }
@@ -553,7 +591,7 @@ void loadConfig() {
 void saveLights() {
   int n = 0;
   for (auto &l : myLights) if (l.isRegistered) n++;
-  prefs.begin("brmesh", true);
+  prefs.begin("brmesh", false);
   prefs.putInt("count", n);
   int i = 0;
   for (auto &l : myLights) {
@@ -597,6 +635,32 @@ void loadLights() {
   Serial.printf("Restored %d lights from NVS\n", n);
 }
 
+// Re-register an already-keyed bulb into the light list + NVS, WITHOUT any
+// air activity or SET_KEY. For when the NVS list records are lost but the key
+// (and the bulb's key) survived — proven by a control command still working.
+// id/name use the exact scheme AddLightCallback assigns (70:e7:.. -> "e770").
+void readdLight(const std::string &mac, uint8_t number) {
+  for (auto &l : myLights) {
+    if (l.address == mac) {
+      Serial.printf("already in the list as #%d\n", l.number);
+      return;
+    }
+  }
+  LightDevice l;
+  l.address = mac;
+  l.type[0] = 0x2A;    // Color (2A A8) — the type of all three of our bulbs
+  l.type[1] = 0xA8;
+  l.number = number;
+  l.id = mac.substr(3, 2) + mac.substr(0, 2);
+  l.name = "Light_" + l.id;
+  l.isRegistered = true;
+  myLights.push_back(l);
+  createLightEntity(l);
+  saveLights();
+  Serial.printf("  + re-added light #%d (%s, %s) under current key\n",
+                number, l.id.c_str(), mac.c_str());
+}
+
 // ============================================================================
 //  Serial console (works in both modes)
 // ============================================================================
@@ -604,17 +668,23 @@ void printHelp() {
   Serial.println("---- BRMesh serial console ----");
   Serial.println("  help                 this help");
   Serial.println("  list                 known lights");
+  Serial.println("  key                  show current mesh key (NVS state)");
   Serial.println("  sel <n>              set target light number");
   Serial.println("  on [n]  off [n]      state (n optional)");
   Serial.println("  br <0-127> [n]       brightness");
   Serial.println("  ct <0-32767> [n]     colour temperature");
   Serial.println("  rgb r g b [n]        colour (0-255 each)");
+  Serial.println("  readd <mac> [num]   re-register a keyed light (list recovery, no air traffic)");
+  Serial.println("  forget <mac|n>      remove a light from our list + NVS (no air traffic; bulb's key untouched)");
   Serial.println("  scan [sec=5]         re-run discovery / key new bulbs");
   Serial.println("  bootcatch [sec=12]   WAKE+scan; use while power-cycling a bulb");
   Serial.println("  raw [sec=5]          unfiltered BLE dump (debug)");
+  Serial.println("  rawp [sec=5]         PASSIVE raw dump — best for a phone one-shot (Forget/Reset)");
   Serial.println("  rawwake [sec=5]      WAKE broadcast + every frame (debug)");
   Serial.println("  wake [sec=3]         broadcast our WAKE only (no scan)");
   Serial.println("  wakephone [sec=3]    replay the phone's WAKE bytes (no scan)");
+  Serial.println("  scanstop             end a running raw scan on demand");
+  Serial.println("  clear                remove all known lights (list + NVS; keeps key)");
   Serial.println("  --------------------------");
 }
 
@@ -638,6 +708,11 @@ void handleCommand(char* line) {
     for (auto &l : myLights)
       Serial.printf("  #%d %s [%s] %s\n", l.number, l.name.c_str(), l.id.c_str(),
                     l.isRegistered ? "registered" : "factory-key");
+  }
+
+  else if (strcmp(argv[0], "key") == 0) {
+    Serial.printf("current mesh key: %02X %02X %02X %02X\n",
+                  my_key[0], my_key[1], my_key[2], my_key[3]);
   }
 
   else if (strcmp(argv[0], "sel") == 0) {
@@ -668,13 +743,63 @@ void handleCommand(char* line) {
     Serial.printf("sent rgb=%d,%d,%d to #%d\n", atoi(argv[1]), atoi(argv[2]), atoi(argv[3]), target);
   }
 
+  else if (strcmp(argv[0], "readd") == 0) {
+    if (argc < 2) { Serial.println("usage: readd <mac> [num]"); return; }
+    uint8_t next = 0;
+    for (auto &l : myLights) if (l.number > next) next = l.number;
+    uint8_t num = (argc >= 3) ? (uint8_t)atoi(argv[2]) : (uint8_t)(next + 1);
+    readdLight(std::string(argv[1]), num);
+  }
+
+  else if (strcmp(argv[0], "forget") == 0) {
+    if (argc < 2) { Serial.println("usage: forget <mac|n>   (remove a light from our list + NVS; no air traffic)"); return; }
+    std::string arg = argv[1];
+    bool byMac = (arg.find(':') != std::string::npos);
+    bool found = false;
+    for (auto it = myLights.begin(); it != myLights.end(); ++it) {
+      bool match = byMac ? (it->address == arg)
+                         : (it->number == (uint8_t)atoi(arg.c_str()));
+      if (match) {
+        Serial.printf("forgetting #%d %s [%s]\n", it->number, it->name.c_str(), it->id.c_str());
+        myLights.erase(it);
+        found = true;
+        break;
+      }
+    }
+    if (!found) { Serial.printf("no light matching '%s' in the list (use 'list')\n", arg.c_str()); return; }
+    saveLights();
+    // NOTE(bridge, deferred): also drop the matching HA entity here once ENABLE_WIFI is on.
+    Serial.println("forgotten from the list + NVS. (The bulb's key is untouched — nothing was sent over the air.)");
+  }
+
   else if (strcmp(argv[0], "scan") == 0) {
     if (argc >= 2) g_scanSeconds = atoi(argv[1]);
     scanRequested = true;
   }
   else if (strcmp(argv[0], "bootcatch") == 0) scan((argc >= 2) ? atoi(argv[1]) : 12);
   else if (strcmp(argv[0], "raw") == 0) rawScan((argc >= 2) ? atoi(argv[1]) : 5);
+  else if (strcmp(argv[0], "rawp") == 0) rawScanPassive((argc >= 2) ? atoi(argv[1]) : 5);
   else if (strcmp(argv[0], "rawwake") == 0) rawWake((argc >= 2) ? atoi(argv[1]) : 5);
+  else if (strcmp(argv[0], "scanstop") == 0) scanStop();
+
+  else if (strcmp(argv[0], "clear") == 0) {
+    // Wipe the known-lights list (RAM + NVS); keeps our mesh key. Needed before
+    // re-keying a bulb whose stale NVS entry would make addLights() skip it.
+    prefs.begin("brmesh", false);
+    int n = prefs.getInt("count", 0);
+    for (int i = 0; i < n; i++) {
+      prefs.remove(("id" + String(i)).c_str());
+      prefs.remove(("nm" + String(i)).c_str());
+      prefs.remove(("t0" + String(i)).c_str());
+      prefs.remove(("t1" + String(i)).c_str());
+      prefs.remove(("num" + String(i)).c_str());
+    }
+    prefs.putInt("count", 0);
+    prefs.end();
+    myLights.clear();
+    g_target = 0;
+    Serial.printf("Cleared %d light(s) from list + NVS (mesh key kept)\n", n);
+  }
   else if (strcmp(argv[0], "wake") == 0) wakeFor((argc >= 2) ? atoi(argv[1]) : 3);
   else if (strcmp(argv[0], "wakephone") == 0) wakePhone((argc >= 2) ? atoi(argv[1]) : 3);
 
@@ -749,10 +874,10 @@ void setup() {
   mqtt = new HAMqtt(client, device);
 #endif
 
-  // 2) BLE (classic ESP32 stack) - advertising + scanning.
-  BLEDevice::init("ESP32 as iBeacon");
-  pAdvertising = BLEDevice::getAdvertising();
-  BLEDevice::startAdvertising();
+  // 2) BLE (NimBLE host) - advertising + scanning.
+  NimBLEDevice::init("BRMesh Controller");
+  pAdvertising = NimBLEDevice::getAdvertising();
+  pAdvertising->start();
 
 #if ENABLE_WIFI
   // 3) WiFi.

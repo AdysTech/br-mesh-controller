@@ -46,7 +46,11 @@ def main():
     # ~t=3 and has a full window to boot + advertise its identity frame.
     time.sleep(1.0)
     print(">> POWER OFF"); print("   ", power("OFF"))
-    time.sleep(2.0)
+    # Long enough that the bulb's capacitors drain and it COLD-boots (a short
+    # gap cap-bridges and the bulb never re-enters its boot/pairing window).
+    off_gap = float(os.environ.get("OFF_DELAY", "3.0"))
+    print(">> (holding OFF %.1fs to drain caps)" % off_gap)
+    time.sleep(off_gap)
     print(">> POWER ON");  print("   ", power("ON"))
     print(">> (bulb now boots into the ongoing WAKE; watch for detect + key)")
 
