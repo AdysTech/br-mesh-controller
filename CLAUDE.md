@@ -13,6 +13,12 @@ BLE + serial console only, no WiFi/MQTT/HA.
 This file keeps only the model, current status, the catch recipe, console, and
 toolchain.
 
+**Code layout — a 3-layer split (keep `main.cpp` lean for the bridge stage):**
+- [src/MeshController.{h,cpp}](src/MeshController.h) — the engine: key + lights + BLE advertise/scan + discovery/keying + NVS persistence
+- [src/console.{h,cpp}](src/console.h) — the serial console driver (POC UI); consumes a `MeshController&`
+- [src/main.cpp](src/main.cpp) — thin app shell: setup/loop + the HA/HTTP front ends under `ENABLE_WIFI`
+- [src/protocol.{h,cpp}](src/protocol.h) — FastCon byte codec (unchanged) · [src/light.h](src/light.h) — shared `LightDevice`
+
 ---
 
 ## 1. Core model (do NOT deviate)
@@ -30,38 +36,23 @@ toolchain.
 - **Persistent boot:** key + light list in NVS (`brmesh` namespace); on boot,
   restore them (no re-keying) and key **only new** factory-keyed bulbs.
 
-## 2. STATUS (2026-11-18)
+## 2. Proven state → the standing rules it gave us
 
-**POC COMPLETE** on `70:e7:f2:72:70:e8` (light #1, our key `09 90 1D D8`):
-detect → key → control (physically verified) → NVS persistence across reboots,
-plus `readd` list recovery. **Do not re-litigate:** [src/protocol.cpp](src/protocol.cpp)
-is byte-identical to the proven community reference (protocol.md §3), the active
-scan sees the bulbs, and the detection/keying logic matches the real captured
-factory frame.
+The POC is **proven** on `70:e7:f2:72:70:e8` (light #1, key `09 90 1D D8`):
+detect → key → control → NVS persistence across reboots. Don't re-derive it.
 
-**Fixed gotcha:** `prefs.begin(name, readOnly=true)` opens NVS read-only, so
-`put*` silently no-ops — write paths must use `false`
-([src/main.cpp:585](src/main.cpp#L585) key-gen, [src/main.cpp:594](src/main.cpp#L594)
-`saveLights()`).
-
-**BLE stack:** glue in [src/main.cpp](src/main.cpp) is **NimBLE-Arduino 2.x**
-(migrated 2026-11-16 from Bluedroid so later Improv provisioning shares one host
-stack). `protocol.cpp` untouched. **NimBLE-esp32 drops the advertiser the moment
-a scan starts**, so WAKE+scan can't run concurrently (Bluedroid could). The fix is
-[slicedAdvertiseScan()](src/main.cpp) — a WAKE/SET_KEY advertise burst → scan burst
-loop — that `rawWake`, `scan`, and `addLight` all route through. Re-proven on the
-NimBLE build 2026-11-18 (detect → key → ON/OFF all verified).
-
-**The 3 bulbs** (all factory OUI `f2:72:70:e8`, type `2A A8`):
-
-| MAC | state |
-|---|---|
-| `70:e7:f2:72:70:e8` | **keyed by us (#1)**; on the Tasmota power switch — the only bulb we can power-cycle |
-| `2a:e6:f2:72:70:e8` | untouched, no controllable power |
-| `0b:ed:f2:72:70:e8` | untouched, no controllable power |
-
-**Remaining:** key the other two (put on controllable power or factory-reset via
-the app, then run the §3 recipe); then the bridge per BRIDGE_PLAN.md.
+- **[src/protocol.cpp](src/protocol.cpp) is byte-identical to the proven community
+  reference** (protocol.md §3). It is the wire source of truth — do NOT "fix" it.
+- **NVS write paths must call `prefs.begin(name, false)`.** `readOnly=true` opens the
+  namespace read-only and `put*` silently no-ops (key-gen + `saveLights()` in
+  [src/MeshController.cpp](src/MeshController.cpp)).
+- **NimBLE can't advertise and scan at once** — the controller drops the advertiser
+  the moment a scan starts. WAKE+scan must be time-sliced via
+  [slicedAdvertiseScan()](src/MeshController.cpp) (advertise burst → scan burst loop);
+  never the concurrent Bluedroid pattern.
+- **Bulbs on air:** factory OUI `f2:72:70:e8`, type `2A A8`. Test target = `70:e7`
+  (on the Tasmota power switch). `2a:e6` / `0b:ed` are **not** test targets — ignore.
+- **Next:** the bridge per [BRIDGE_PLAN.md](BRIDGE_PLAN.md).
 
 ## 3. Discovery / keying (the proven catch recipe)
 
@@ -75,7 +66,7 @@ only while WAKE is on the air. Proven recipe:
 
 Driver: [tools/scan_catch.py](tools/scan_catch.py). **NimBLE can't advertise and
 scan at once** (the ESP32 controller drops the advertiser when the scan starts),
-so `scan` uses [slicedAdvertiseScan()](src/main.cpp) — a WAKE/SET_KEY advertise
+so `scan` uses [slicedAdvertiseScan()](src/MeshController.cpp) — a WAKE/SET_KEY advertise
 burst → scan burst loop — instead of the old concurrent Bluedroid pattern. `wantDuplicates=true`
 still matters: the bulb interleaves bare beacons with identity frames and dedup
 drops them. Keying (`addLight`) time-slices the same way. If the NVS light list is
@@ -103,13 +94,13 @@ wake [sec] | wakephone [sec]                  broadcast-only debug
 - Board `waveshare_esp32_s3_zero` (pioarduino core, 4 MB flash / 2 MB PSRAM),
   native USB: `-DARDUINO_USB_MODE=1 -DARDUINO_USB_CDC_ON_BOOT=1`.
 - **POC build boundary:** `build_src_filter` in [platformio.ini](platformio.ini)
-  scopes the build to `main.cpp` + `protocol.cpp`; the untracked bridge
-  scaffolding (`settings.*`, `statusled.*`, `light.h`, `web/`) must NOT compile
-  into the POC.
+  scopes the build to `main.cpp` + `protocol.cpp` + `MeshController.cpp` +
+  `console.cpp` (+ the shared `light.h`); the untracked bridge scaffolding
+  (`settings.*`, `statusled.*`, `web/`) must NOT compile into the POC.
 - **Serial port:** `/dev/ttyACM0` or `/dev/ttyACM1` — **it can swap on
   power-cycles** (`ls /dev/ttyACM*`; override with `ESP_SERIAL_PORT=...`).
   `monitor_port` in platformio.ini is stale.
-- **DTR/RTS from the host does NOT reset this board** (probed 2026-11-16).
+- **DTR/RTS from the host does NOT reset this board.**
   Reset via the RESET button or a USB power-cycle; `tools/esp_serial.py boot`
   only listens.
 
@@ -131,9 +122,19 @@ calls; on a denial, **stop and report**, don't retry verbatim.
 - [tools/scan_catch.py](tools/scan_catch.py) — **the proven one**: `scan 12` + early power-cycle.
 - [tools/raw_catch.py](tools/raw_catch.py), [tools/rawwake_catch.py](tools/rawwake_catch.py) —
   raw manufacturer-frame dumps; the field path for reverse-engineering a new bulb model.
+- [tools/staged_capture.py](tools/staged_capture.py) — ENTER-driven staged passive capture
+  (hunt driver for the phone's one-shot group frames; `scanstop` ends a stage).
+  Capture logs land in `tools/capture_*.log`.
+- [tools/decode_fastcon.py](tools/decode_fastcon.py) — **the FastCon decoder**: inverts
+  protocol.cpp's encode pipeline (preamble restore, LFSR de-whiten seed `0x25`), reads
+  the command TYPE off a captured payload without needing the command key.
 
 ## 7. Standing rules / gotchas
 
+- **Trust this file as the repo map.** If a tool isn't listed in §6 it doesn't exist —
+  do NOT re-scan the repo for prior art or re-derive the codec/whitening that
+  `protocol.md` + [tools/decode_fastcon.py](tools/decode_fastcon.py) already define.
+  Start from the map, not from a search. Keep §6 current when you add tooling.
 - **DO NOT** loop/retry network calls or pin toggles — stop and report on denial.
 - The `#if ENABLE_WIFI` blocks (HA/MQTT/HTTP) are **dead code in the POC** but must
   keep compiling when flipped to 1 — the HA lib (`dawidchyrzynski/home-assistant-
