@@ -1,8 +1,9 @@
 # CLAUDE.md — BRMesh → Home Assistant controller (ESP32-S3)
 
 ESP32-S3 firmware that bridges **BRGD/BRMesh BLE lights** into **Home Assistant**
-over MQTT. Currently **POC mode** (`ENABLE_WIFI=0` in [src/config.h](src/config.h)):
-BLE + serial console only, no WiFi/MQTT/HA.
+over MQTT. Currently **Phase 0** (single build, one env): BLE FastCon engine +
+serial console + WiFi STA with **Improv BLE** provisioning. No web UI, no
+MQTT/HA yet (Phase 1 / Phase 3).
 
 **Read the siblings before touching code — they are the sources of truth:**
 - [protocol.md](protocol.md) — the FastCon air protocol, byte-level (framing,
@@ -15,9 +16,11 @@ toolchain.
 
 **Code layout — a 3-layer split (keep `main.cpp` lean for the bridge stage):**
 - [src/MeshController.{h,cpp}](src/MeshController.h) — the engine: key + lights + BLE advertise/scan + discovery/keying + NVS persistence
-- [src/console.{h,cpp}](src/console.h) — the serial console driver (POC UI); consumes a `MeshController&`
-- [src/main.cpp](src/main.cpp) — thin app shell: setup/loop + the HA/HTTP front ends under `ENABLE_WIFI`
+- [src/console.{h,cpp}](src/console.h) — the serial console driver; consumes a `MeshController&`
+- [src/main.cpp](src/main.cpp) — thin app shell: setup/loop + §5 boot gate (NVS creds → STA → Improv)
+- [src/settings.{h,cpp}](src/settings.h) — NVS-backed settings (creds, name, MQTT) · [src/statusled.{h,cpp}](src/statusled.h) — WS2812 status LED (native `rgbLedWrite`)
 - [src/protocol.{h,cpp}](src/protocol.h) — FastCon byte codec (unchanged) · [src/light.h](src/light.h) — shared `LightDevice`
+- [src/web/](src/web/) — untracked Phase-1 scaffolding, NOT in the build filter yet
 
 ---
 
@@ -72,7 +75,7 @@ still matters: the bulb interleaves bare beacons with identity frames and dedup
 drops them. Keying (`addLight`) time-slices the same way. If the NVS light list is
 ever lost: `readd <mac> [num]`.
 
-## 4. Serial console (POC, 115200 baud)
+## 4. Serial console (115200 baud)
 
 `help` for the full list. Essentials:
 
@@ -85,7 +88,14 @@ bootcatch [sec=12]    WAKE + concurrent scan (run while power-cycling a bulb)
 raw [sec]             unfiltered per-frame hex dump (debug)
 rawwake [sec]         WAKE broadcast + every frame (proved WAKE triggers identity)
 wake [sec] | wakephone [sec]                  broadcast-only debug
+prov                  clear saved WiFi creds + reboot into Improv provisioning
+hostname [name]       show / set device name (DHCP hostname; NVS 'name')
 ```
+
+**Provisioning boot:** on a boot where WiFi is unprovisioned/failing, the mesh
+engine is NOT started — Improv owns the BLE radio for that boot, so the radio
+commands above are rejected ("engine offline (provisioning mode)"). `prov`,
+`list`, `help` etc. still work.
 
 ## 5. Build / flash / serial toolchain
 
@@ -93,10 +103,11 @@ wake [sec] | wakephone [sec]                  broadcast-only debug
   `/home/rao/.platformio/penv/bin/python`.
 - Board `waveshare_esp32_s3_zero` (pioarduino core, 4 MB flash / 2 MB PSRAM),
   native USB: `-DARDUINO_USB_MODE=1 -DARDUINO_USB_CDC_ON_BOOT=1`.
-- **POC build boundary:** `build_src_filter` in [platformio.ini](platformio.ini)
-  scopes the build to `main.cpp` + `protocol.cpp` + `MeshController.cpp` +
-  `console.cpp` (+ the shared `light.h`); the untracked bridge scaffolding
-  (`settings.*`, `statusled.*`, `web/`) must NOT compile into the POC.
+- **One board, one build** (`waveshare_esp32_s3_zero`). `build_src_filter` in
+  [platformio.ini](platformio.ini) scopes it to `main.cpp` + `protocol.cpp` +
+  `MeshController.cpp` + `console.cpp` + `settings.cpp` + `statusled.cpp`
+  (+ the shared `light.h`); the untracked `web/` scaffolding stays OUT until
+  Phase 1. There is no separate POC / `ENABLE_WIFI=0` build — the flag is gone.
 - **Serial port:** `/dev/ttyACM0` or `/dev/ttyACM1` — **it can swap on
   power-cycles** (`ls /dev/ttyACM*`; override with `ESP_SERIAL_PORT=...`).
   `monitor_port` in platformio.ini is stale.
@@ -136,8 +147,22 @@ calls; on a denial, **stop and report**, don't retry verbatim.
   `protocol.md` + [tools/decode_fastcon.py](tools/decode_fastcon.py) already define.
   Start from the map, not from a search. Keep §6 current when you add tooling.
 - **DO NOT** loop/retry network calls or pin toggles — stop and report on denial.
-- The `#if ENABLE_WIFI` blocks (HA/MQTT/HTTP) are **dead code in the POC** but must
-  keep compiling when flipped to 1 — the HA lib (`dawidchyrzynski/home-assistant-
-  integration`) is commented out of [platformio.ini](platformio.ini) and re-added then.
+- **No `ENABLE_WIFI` flag** — it was removed when the two builds collapsed into one
+  (one board, one firmware). The HA lib (`dawidchyrzynski/home-assistant-integration`)
+  is commented out of [platformio.ini](platformio.ini) and re-added in **Phase 3**;
+  `web/` stays out of `build_src_filter` until **Phase 1**. Do NOT re-introduce the
+  build-flag split.
 - `protocol.md` is the wire-format source of truth — don't copy frame layout back
   here.
+- **Core hostname quirk (verified on hardware):** `WiFi.setHostname()` only
+  writes a static buffer; the core applies it to the STA netif **inside**
+  `WiFi.mode(WIFI_STA)` (the first enabling transition of a boot — after that a
+  later `setHostname` never reaches the netif; symptom: DHCP advertises the
+  generated `esp32s3-<mac>`). So the boot path must order
+  `setHostname(name)` **before** `WiFi.mode(WIFI_STA)`, and a runtime change
+  (console `hostname`) must go through
+  `Network.getDefaultInterface()->setHostname()`.
+- **S3-Zero WS2812B is physically GRB** despite the variant claiming
+  `RGB_BUILTIN_LED_COLOR_ORDER=RGB` (verified: intended red showed as teal).
+  Use `rgbLedWriteOrdered(RGB_BUILTIN, LED_COLOR_ORDER_GRB, r, g, b)` — see
+  [src/statusled.cpp](src/statusled.cpp).

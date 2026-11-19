@@ -556,4 +556,5 @@ void MeshController::begin() {
   pAdvertising = NimBLEDevice::getAdvertising();
   pAdvertising->start();
   loadKeyOrGenerate();
+  started_ = true;
 }

@@ -1,6 +1,6 @@
 #pragma once
 // ============================================================================
-//  Console — the serial console driver (POC / ENABLE_WIFI=0 UI).
+//  Console — the serial console driver.
 //
 //  A thin command parser over a MeshController instance. Knows the wire protocol for the
 //  console text only; every action it does delegates to MeshController. The bridge's HTTP

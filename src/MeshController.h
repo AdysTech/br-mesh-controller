@@ -9,8 +9,8 @@
 //  HTTP, or the serial console.
 //
 //  Drivers consume a MeshController instance through the public methods below:
-//    * the serial console (POC / ENABLE_WIFI=0)          -> console.cpp
-//    * HA + HTTP (bridge / ENABLE_WIFI=1)                -> main.cpp (P0-P3)
+//    * the serial console (Phase 0/1 UI)                 -> console.cpp
+//    * HTTP + HA/MQTT (bridge front ends, Phase 1/3)     -> main.cpp / web/
 //  Adding a new driver never touches this class.
 //
 //  The FastCon byte codec (the load-bearing, proven part) lives separately in
@@ -41,6 +41,11 @@ class MeshController {
   /// needs that ordering: HA discovery is lost if entities exist before
   /// mqtt->begin(); see BRIDGE_PLAN.md §7.)
   void begin();
+
+  /// True once begin() has run. The console uses it to reject radio commands
+  /// on a provisioning boot (bridge mode), where the engine is deliberately
+  /// never started — Improv owns the BLE radio for that boot.
+  bool started() const { return started_; }
 
   /// Per-loop work: run a pending background scan request (requestScan()).
   /// Cheap to call every loop(); a no-op when nothing is queued.
@@ -145,4 +150,5 @@ class MeshController {
   bool scanRequested_ = false;
   int scanSeconds_ = SCAN_DURATION;
   bool isScanning_ = false;
+  bool started_ = false;
 };

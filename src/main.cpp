@@ -5,126 +5,111 @@
 //  engine (MeshController) to its front ends. The heavy lifting lives elsewhere:
 //
 //    * protocol.{h,cpp}  — the FastCon byte codec (pure, testable)
-//    * mesh.{h,cpp}      — the engine: key + lights + BLE advertise/scan +
-//                          discovery/keying + NVS persistence (MeshController class)
-//    * console.{h,cpp}   — the serial console driver (POC UI)
+//    * MeshController.*  — the engine: key + lights + BLE advertise/scan +
+//                          discovery/keying + NVS persistence
+//    * console.{h,cpp}   — the serial console driver
 //
-//  Two build modes:
-//    ENABLE_WIFI=0  -> serial console drives control frames directly (POC).
-//    ENABLE_WIFI=1  -> each light is exposed as its own HA entity via MQTT,
-//                      plus HTTP status/rescan. The HA + HTTP code below is
-//                      that second front end — a peer of the console, not a
-//                      replacement (both consume the same MeshController).
+//  BRIDGE_PLAN §5 boot flow: NVS creds -> bounded STA attempt -> Improv BLE
+//  provisioning fallback. Web (Phase 1) + MQTT/HA (Phase 3) front ends land
+//  here later.
+//
+//  Provisioning rule: on a provisioning boot the mesh engine is NEVER started
+//  — Improv owns the BLE radio for that boot, and provisioning always ends in
+//  a reboot, so Improv and MeshController never coexist (and never share a
+//  boot). A pre-provisioned board skips Improv and reaches the engine.
 // ============================================================================
 
 #include <Arduino.h>
+#include <WiFi.h>
+#include <Network.h>
+#include <ImprovWiFiBLE.h>
 
 #include "config.h"
 #include "MeshController.h"
 #include "console.h"
-
-#if ENABLE_WIFI
-  #include <WiFi.h>
-  #include <ArduinoHA.h>
-  #include <WebServer.h>
-#endif
+#include "settings.h"
+#include "statusled.h"
 
 // ============================================================================
-//  App instances: one engine, its drivers, and the (bridge-only) network bits.
+//  App instances: one engine + its serial driver + Improv (provisioning).
 // ============================================================================
 MeshController g_mesh;
 Console g_console(g_mesh);
+ImprovWiFiBLE g_improv;
 
-#if ENABLE_WIFI
-  WiFiClient client;
-  HADevice device;
-  HAMqtt* mqtt = nullptr;
-  WebServer server;
-#endif
+static bool     s_provisioning = false;
+static uint32_t s_provStarted  = 0;
 
-// ============================================================================
-//  HA light entity (bridge mode only) — a driver on top of MeshController
-// ============================================================================
-#if ENABLE_WIFI
-void onStateCommand(bool state, HALight* sender) {
-  LightDevice* l = g_mesh.findLightById(sender->uniqueId());
-  if (!l) return;
-  Serial.printf("HA state %s -> #%d\n", state ? "ON" : "OFF", l->number);
-  g_mesh.state(l->number, state);
-  sender->setState(state);
-}
-void onBrightnessCommand(uint8_t brightness, HALight* sender) {
-  LightDevice* l = g_mesh.findLightById(sender->uniqueId());
-  if (!l) return;
-  Serial.printf("HA brightness %d -> #%d\n", brightness, l->number);
-  g_mesh.brightness(l->number, brightness);
-  sender->setBrightness(brightness);
-}
-void onColorTemperatureCommand(uint16_t temperature, HALight* sender) {
-  LightDevice* l = g_mesh.findLightById(sender->uniqueId());
-  if (!l) return;
-  Serial.printf("HA colorTemp %d -> #%d\n", temperature, l->number);
-  g_mesh.colorTemp(l->number, temperature);
-  sender->setColorTemperature(temperature);
-}
-void onRGBColorCommand(HALight::RGBColor color, HALight* sender) {
-  LightDevice* l = g_mesh.findLightById(sender->uniqueId());
-  if (!l) return;
-  Serial.printf("HA RGB %d,%d,%d -> #%d\n", color.red, color.green, color.blue, l->number);
-  g_mesh.rgb(l->number, color.red, color.green, color.blue);
-  sender->setRGBColor(color);
+// BLE name: "BRMesh-" + the chip MAC's last two octets (identifies the unit).
+static const char* improvName() {
+  static char name[16];
+  uint8_t mac[6];
+  WiFi.macAddress(mac);
+  snprintf(name, sizeof(name), "BRMesh-%02X%02X", mac[4], mac[5]);
+  return name;
 }
 
-void createLightEntity(LightDevice& l) {
-  const bool rgbw = (l.type[0] == 0xa1 && l.type[1] == 0xa8) || (l.type[0] == 0x2a && l.type[1] == 0xa8);
-  const bool rgb  = (l.type[0] == 0xa0 && l.type[1] == 0xa8);
+// P0.3 — re-entry: console `prov` (later web "Provision via BLE"):
+// clear the saved WiFi creds -> reboot into the Improv branch.
+void requestProvisioning() {
+  Serial.println("prov: clearing saved WiFi creds, rebooting into Improv");
+  clearWiFiCreds();
+  WiFi.persistent(false);   // keep the WiFi driver's own NVS slot out of play
+  WiFi.disconnect(true);    // and wipe it if present
+  delay(300);
+  ESP.restart();
+}
 
-  HALight* light = nullptr;
-  if (rgbw) {
-    light = new HALight(l.id.c_str(),
-                        HALight::BrightnessFeature | HALight::ColorTemperatureFeature | HALight::RGBFeature);
-    light->onStateCommand(onStateCommand);
-    light->onBrightnessCommand(onBrightnessCommand);
-    light->onColorTemperatureCommand(onColorTemperatureCommand);
-    light->onRGBColorCommand(onRGBColorCommand);
-    light->setBrightnessScale(127);
-    light->setBrightness(127);
-  } else if (rgb) {
-    light = new HALight(l.id.c_str(), HALight::BrightnessFeature | HALight::RGBFeature);
-    light->onStateCommand(onStateCommand);
-    light->onBrightnessCommand(onBrightnessCommand);
-    light->onRGBColorCommand(onRGBColorCommand);
-    light->setBrightnessScale(127);
-    light->setBrightness(127);
-  } else {
-    light = new HALight(l.id.c_str());   // Smart - on/off only
-    light->onStateCommand(onStateCommand);
+// P0.x — console `hostname <name>` (Tasmota-style SetHostName): persist the
+// device name (NVS "name", already used at boot for the DHCP hostname) and
+// apply it to the live netif — the core only snapshots the stored name onto
+// the STA netif inside the first WiFi.mode(WIFI_STA) of a boot, so a bare
+// WiFi.setHostname() would not reach an already-connected interface.
+void setDeviceName(const char* name) {
+  Settings s = loadSettings();
+  s.name = name;
+  saveSettings(s);
+  NetworkInterface* def = Network.getDefaultInterface();
+  if (def && def->setHostname(name)) {
+    Serial.printf("hostname '%s' saved + applied (DHCP lease picks it up at renewal/reconnect)\n", name);
+    return;
   }
-  light->setName(l.name.c_str());
-  l.light = light;
-  Serial.printf("  created HA light '%s' (id=%s)\n", l.name.c_str(), l.id.c_str());
+  Serial.printf("hostname '%s' saved — active from the next boot/connect\n", name);
 }
 
-// ---- HTTP status / rescan (bridge mode only) ----
-void handleStatus() {
-  String s = "BRMesh Controller\n\n";
-  s += "Registered lights:\n";
-  const auto& lights = g_mesh.lights();
-  if (lights.empty()) s += "  (none)\n";
-  for (auto &l : lights) {
-    if (!l.isRegistered) continue;
-    s += String("  #") + String(l.number) + " " + String(l.name.c_str());
-    s += " [" + String(l.id.c_str()) + "]\n";
-  }
-  s += "\nGET /scan to re-run discovery\n";
-  server.send(200, "text/plain", s);
+// Start the Improv BLE service. The brmesh NVS settings are the single
+// source of truth for creds: a custom connect handler saves them (bypassing
+// the library's own driver-NVS connect path) and reboots, so the very next
+// boot goes straight at STA with the new creds.
+void launchProvisioning() {
+  s_provisioning = true;
+  s_provStarted  = millis();
+  ledSet(LED_AP);
+  Serial.println("=== Improv provisioning (BLE) ===");
+  Serial.printf("  BLE name : %s\n", improvName());
+  Serial.println("  Phone/PC : open https://www.improv-wifi.com (Chrome/Edge) and scan");
+  Serial.printf("  Window   : %lu s, then reboot to retry\n", PROV_TIMEOUT_MS / 1000);
+
+  WiFi.persistent(false);
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(true);    // wipe any stale driver-NVS creds
+
+  g_improv.setCustomConnectWiFi([](const char* ssid, const char* pass) -> bool {
+    Serial.printf("Improv: creds received (ssid=%s) — saving to NVS\n", ssid);
+    Settings s = loadSettings();
+    s.ssid = ssid;
+    s.pass = pass ? pass : "";
+    saveSettings(s);
+    delay(1000);            // let the phone read the PROVISIONED state
+    ESP.restart();
+    return true;            // unreachable
+  });
+
+  // setDeviceInfo() initializes NimBLE and starts the Improv advertising.
+  g_improv.setDeviceInfo(ImprovTypes::ChipFamily::CF_ESP32,
+                         improvName(), "1.0", improvName());
+  Serial.println("Improv: ready. Serial console still available (type 'help').");
 }
-void handleScan() {
-  if (g_mesh.isScanning()) { server.send(200, "text/plain", "already scanning"); return; }
-  g_mesh.requestScan();
-  server.send(200, "text/plain", "scan requested");
-}
-#endif
 
 // ============================================================================
 //  Setup / loop
@@ -133,76 +118,76 @@ void setup() {
   Serial.begin(115200);
   delay(250);
   Serial.println("\n=== BRMesh Controller ===");
-  Serial.printf("ENABLE_WIFI=%d\n", ENABLE_WIFI);
 
-  if (LED_PIN >= 0) {
-    pinMode(LED_PIN, OUTPUT);
-    digitalWrite(LED_PIN, HIGH);   // on while setting up / discovering
+  ledInit();
+  ledSet(LED_BOOT);
+
+  // ---- BRIDGE_PLAN §5 boot flow: NVS creds -> bounded STA -> Improv -------
+  // The mesh engine is deliberately NOT started on a provisioning boot (see
+  // the file header): Improv owns the BLE radio for that boot.
+  const Settings s = loadSettings();
+  bool wifiUp = false;
+  if (!s.ssid.empty()) {
+    WiFi.persistent(false);   // the driver's own NVS STA slot must not win
+    // ORDER MATTERS (core quirk, verified on hardware): the core snapshots
+    // the stored name onto the STA netif INSIDE WiFi.mode() —
+    // WiFiGenericClass::mode() -> esp_netif_set_hostname(getHostname()).
+    // WiFi.setHostname() after mode() only writes a static buffer that is
+    // never applied again (symptom: DHCP advertised default esp32s3-<mac>).
+    WiFi.setHostname(s.name.c_str());
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(s.ssid.c_str(), s.pass.c_str());
+    Serial.printf("WiFi: connecting to '%s' (timeout %lu s)...\n",
+                  s.ssid.c_str(), WIFI_CONNECT_TIMEOUT_MS / 1000);
+    const uint32_t t0 = millis();
+    while (millis() - t0 < WIFI_CONNECT_TIMEOUT_MS) {
+      if (WiFi.status() == WL_CONNECTED) break;
+      delay(250);
+    }
+    wifiUp = (WiFi.status() == WL_CONNECTED);
+    if (wifiUp) {
+      Serial.printf("WiFi: connected, IP %s\n", WiFi.localIP().toString().c_str());
+      ledSet(LED_WIFI);
+    }
+  }
+  if (!wifiUp) {
+    Serial.println("WiFi: not configured or connect failed -> provisioning");
+    launchProvisioning();
+    g_console.banner();
+    return;   // loop(): console + LED + window timeout only
   }
 
-  // 1) Engine: BLE init + restore/generate the key.
+  // 1) Engine: BLE init + restore/generate the mesh key.
   g_mesh.begin();
   {
     const uint8_t* k = g_mesh.key();
     Serial.printf("Mesh key: %02X %02X %02X %02X\n", k[0], k[1], k[2], k[3]);
   }
 
-#if ENABLE_WIFI
-  // 2) HA device + MQTT. Wire the engine's onRegistered hook to HA entity
-  //    creation so both loadLights() and live keying spawn entities.
-  byte mac[6];
-  WiFi.macAddress(mac);
-  device.setUniqueId(mac, sizeof(mac));
-  device.setName("BRMesh");
-  device.setManufacturer("BRMesh");
-  device.setModel("BRMesh");
-  mqtt = new HAMqtt(client, device);
-  g_mesh.setOnRegistered(&createLightEntity);
-
-  // 3) WiFi.
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.println("Connecting to WiFi..."); }
-  Serial.print("WiFi IP: ");
-  Serial.println(WiFi.localIP());
-#endif
-
-  // 4) Restore previously-registered lights (no re-keying).
+  // 2) Restore previously-registered lights (no re-keying).
   g_mesh.loadLights();
 
-  // 5) Discover NEW factory-key bulbs and key them under our key.
-  g_mesh.addLights(SCAN_DURATION);
-
-  if (LED_PIN >= 0) digitalWrite(LED_PIN, LOW);
-
-#if ENABLE_WIFI
-  // 6) HTTP status / rescan.
-  server.on("/", handleStatus);
-  server.on("/scan", handleScan);
-  server.begin();
-
-  // 7) Start MQTT (publishes HA auto-discovery for every light).
-  //    NOTE(BRIDGE_PLAN §7): entities must be created after mqtt->begin();
-  //    the current ordering predates that — reorder here in the P0 bridge pass.
-  mqtt->begin(MQTT_BROKER_ADDR, MQTT_PORT);
-#endif
-
-  Serial.println("Ready.");
-  if (!ENABLE_WIFI) {
-    Serial.println("Test mode: use the serial console (type 'help').");
-    Serial.println("To key the bulb, power-cycle it, then type 'scan'.");
-  }
+  Serial.println("Ready. Use the serial console for discovery (type 'help').");
+  Serial.println("To key the bulb, power-cycle it, then type 'bootcatch 12'.");
   g_console.banner();
 }
 
 void loop() {
-  // Engine: run any queued background scan (console 'scan' / HTTP /scan).
+  if (s_provisioning) {
+    ledTick();
+    g_console.poll();
+    if (millis() - s_provStarted > PROV_TIMEOUT_MS) {
+      Serial.println("Improv window expired; rebooting to retry");
+      ESP.restart();
+    }
+    return;   // engine stays offline for the whole provisioning boot
+  }
+
+  // Engine: run any queued background scan (console 'scan' / 'bootcatch').
   g_mesh.loop();
 
-  // Serial console (both modes).
+  // Serial console.
   g_console.poll();
 
-#if ENABLE_WIFI
-  mqtt->loop();
-  server.handleClient();
-#endif
+  ledTick();
 }

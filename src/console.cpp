@@ -1,8 +1,13 @@
 // Serial console driver (see console.h). See mesh.h for the actions it delegates.
 #include "console.h"
 #include "MeshController.h"
+#include "settings.h"
 #include <string.h>
 #include <stdlib.h>
+#include <ctype.h>
+
+void requestProvisioning();   // app shell (main.cpp)
+void setDeviceName(const char* name);
 
 void Console::banner() {
   Serial.println("---- BRMesh serial console ----");
@@ -25,6 +30,8 @@ void Console::banner() {
   Serial.println("  wakephone [sec=3]    replay the phone's WAKE bytes (no scan)");
   Serial.println("  scanstop             end a running raw scan on demand");
   Serial.println("  clear                remove all known lights (list + NVS; keeps key)");
+  Serial.println("  prov                 clear saved WiFi creds + reboot into Improv");
+  Serial.println("  hostname [name]      show / set device name (DHCP hostname, 1-15 chars)");
   Serial.println("  --------------------------");
 }
 
@@ -60,6 +67,21 @@ void Console::handle(const char* line) {
 
   uint8_t n = (argc >= 2) ? (uint8_t)atoi(argv[1]) : 0;
   uint8_t target = (target_ >= 1) ? (uint8_t)target_ : mesh_.firstLightNumber();
+
+  // Radio commands need the engine started. On a provisioning boot (bridge
+  // mode) the engine is deliberately offline — Improv owns the radio, and
+  // touching it here would crash on a null advertiser.
+  const bool radioCmd =
+      (strcmp(argv[0], "on") == 0) || (strcmp(argv[0], "off") == 0) ||
+      (strcmp(argv[0], "br") == 0) || (strcmp(argv[0], "ct") == 0) ||
+      (strcmp(argv[0], "rgb") == 0) || (strcmp(argv[0], "scan") == 0) ||
+      (strcmp(argv[0], "bootcatch") == 0) || (strcmp(argv[0], "raw") == 0) ||
+      (strcmp(argv[0], "rawp") == 0) || (strcmp(argv[0], "rawwake") == 0) ||
+      (strcmp(argv[0], "wake") == 0) || (strcmp(argv[0], "wakephone") == 0);
+  if (radioCmd && !mesh_.started()) {
+    Serial.println("engine offline (provisioning mode) — radio command rejected");
+    return;
+  }
 
   if (strcmp(argv[0], "help") == 0) banner();
 
@@ -128,6 +150,24 @@ void Console::handle(const char* line) {
   else if (strcmp(argv[0], "scanstop") == 0) mesh_.scanStop();
 
   else if (strcmp(argv[0], "clear") == 0) mesh_.clearLights();
+
+  else if (strcmp(argv[0], "prov") == 0) {
+    requestProvisioning();     // clears creds + reboots — no return
+    return;
+  }
+
+  else if (strcmp(argv[0], "hostname") == 0) {
+    if (argc < 2) {
+      Serial.printf("device name (NVS 'name'): %s  —  'hostname <name>' to change\n",
+                    loadSettings().name.c_str());
+      return;
+    }
+    const std::string nm(argv[1]);
+    if (nm.size() < 1 || nm.size() > 15) { Serial.println("name must be 1-15 chars"); return; }
+    for (char c : nm)
+      if (!isalnum((unsigned char)c) && c != '-') { Serial.println("only letters, digits, '-' allowed"); return; }
+    setDeviceName(nm.c_str());
+  }
   else if (strcmp(argv[0], "wake") == 0) mesh_.wakeFor((argc >= 2) ? atoi(argv[1]) : 3);
   else if (strcmp(argv[0], "wakephone") == 0) mesh_.wakePhone((argc >= 2) ? atoi(argv[1]) : 3);
 

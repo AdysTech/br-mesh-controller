@@ -5,10 +5,8 @@
 #include <vector>
 #include "config.h"
 
-#if ENABLE_WIFI
-#include <ArduinoHA.h>
-#endif
-
+// Phase 3 will add the HALight* handle here (home-assistant-integration);
+// keep the data model free of the library until then.
 struct LightDevice {
   std::string address;              // BLE MAC address (identity + logging)
   std::vector<uint8_t> mfgData;     // raw 18-byte manufacturer data (used to key)
@@ -17,7 +15,4 @@ struct LightDevice {
   std::string id;                   // HA unique id
   std::string name;                 // HA friendly name
   uint8_t number = 0;               // light number we assigned it
-#if ENABLE_WIFI
-  HALight* light = nullptr;
-#endif
 };
