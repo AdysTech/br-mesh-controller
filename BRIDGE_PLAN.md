@@ -123,11 +123,17 @@
 
 ### 4.1 Flash Partitions (4 MB board)
 
+lora-relay proven shape (dual OTA + A/B SPA slots; see [partitions.csv](partitions.csv)):
+
 | Partition | Size | Purpose |
 |-----------|------|---------|
-| NVS | ~24 KB | WiFi creds, MQTT host/port/user/pass, controller name, mesh key, light list |
-| app | 2 MB | Firmware (see [partitions.csv](partitions.csv)) |
-| LittleFS | 896 KB | SPA bundle (`index.html.gz`) |
+| nvs | 20 KB | WiFi creds, MQTT host/port/user/pass, controller name, mesh key, light list |
+| otadata | 8 KB | Active OTA slot metadata |
+| phy_init | 4 KB | RF/PHY calibration data |
+| ota_0 | 1.81 MB | Firmware slot A |
+| ota_1 | 1.81 MB | Firmware slot B |
+| spa_b | 96 KB | Inactive SPA slot (`index.html.gz` A/B) |
+| spa_a | 96 KB | Active SPA slot — listed LAST so `pio run -t uploadfs` targets it (`board_build.filesystem_partition = spa_a`) |
 
 ### 4.2 Data Stores
 
@@ -457,6 +463,8 @@ timeout). The rest of the network shell (mDNS, httpd, web) is Phase 1.
 **Deliverable:** A freshly-flashed board, with no serial, gets its WiFi from a
 phone via Improv; a pre-provisioned board skips Improv entirely and reaches IDLE.
 
+**Status: DONE** — Improv provisioning proven on hardware (Appendix A).
+
 ### Phase 1: Connectivity Foundation
 
 Scaffolding already landed: `settings.*`, `statusled.*`, `light.h`,
@@ -470,6 +478,7 @@ NimBLE migration. This phase wires the network shell.
 | P1.3 | Console config commands: `showcfg`, `set name/sid/pass/mqtt …` → NVS — the permanent serial fallback for config (primary path is the web Config page, Phase 2). `hostname [name]` already landed in Phase 0 (Tasmota-style SetHostName; NVS `name` + live netif apply) |
 | P1.4 | platformio.ini: extend `build_src_filter` to include `web/*` (`settings.*`, `statusled.*` already build); HA lib dep stays commented until Phase 3 |
 | P1.5 | Verify the single build still compiles and the proven console commands still work (NFR-03) |
+| P1.6 | Firmware version tracking (lora-relay convention): `src/FirmwareVersion.h` is the single source of truth — `FIRMWARE_VERSION` + `kBoardModel`, one current-release description block, no changelog, bump here when a phase ships. Every surface that reports a version reads it: boot banner, Improv device info, `/api/status` (`fw` + `board`). Phase 2's `tools/build_spa.py` reads the same header (lora-relay regex) and bakes it into the SPA for the version-mismatch check |
 
 **Verification:** flash → creds via Improv (Phase 0) or serial `set sid <ssid>` +
 `set pass <pass>` → reboot → STA connects → from the host: `curl http://brmesh.local/api/status`
@@ -479,6 +488,17 @@ answers JSON, `GET /api/lights` lists the keyed bulb(s), and the serial console
 **Deliverable:** On the LAN, `<name>.local` serves a status page, `GET /api/status`
 and `GET /api/lights` answer, the serial console works side-by-side with the HTTP
 server, and the full config is settable from serial.
+
+**Status: DONE (2026-11-19)** — flashed + verified from the host
+(`curl http://brmesh/…`): `/api/status` (fw `1.1.0` + `board`), `/api/lights`
+(light #1 with mac), `/` (embedded fallback), `/ws/log` (101 + log-tail
+greeting), serial `list`/`showcfg` side-by-side with the HTTP server.
+Partitions are the lora-relay shape (dual OTA + A/B spiffs, `spa_a` active).
+**WiFi watchdog:** `loop()` owns mid-run STA reconnection (the boot flow runs
+once and the driver's own background reconnect gives up) — rate-limited 30 s,
+`LOGF` to the ring (`/ws/log`), LED `ERR`→`WIFI`, fresh `loadSettings()` per
+attempt so a live console `set` is picked up. Verified to not misfire; live
+drop-test pending (toggle the AP).
 
 ### Phase 2: Web UI (Svelte SPA)
 

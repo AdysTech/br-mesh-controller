@@ -1,7 +1,21 @@
-# ESP-IDF Partition Table (4 MB total)
-# Name,   Type, SubType, Offset,  Size, Flags
-nvs,      data, nvs,        0x9000,   20K,
-otadata,  data, ota,        0xe000,    8K,
-ota_0,    app,  ota_0,     0x10000, 2816K,
-ffat,     data, fat,      0x310000,  896K
-coredump, data, coredump, 0x3F0000,   64K
+# Name,   Type, SubType, Offset,   Size,     Flags
+#
+# 4 MB (0x400000) layout for ESP32-S3-Zero (lora-relay proven shape):
+#   ota_0 / ota_1 : 1,900,544 B (0x1D0000) each — dual OTA slots
+#   spa_b / spa_a : 96 KB (0x18000) each; spa_a listed LAST for `pio buildfs`/`uploadfs`
+#
+# Name,   Type, SubType, Offset,   Size,     Flags
+# 20 KB (NVS configuration store)
+nvs,      data, nvs,     0x9000,   0x5000,
+# 8 KB (active OTA slot metadata)
+otadata,  data, ota,     0xE000,   0x2000,
+# 4 KB (RF / PHY calibration data)
+phy_init, data, phy,     0x10000,  0x1000,
+# 1.8125 MB / 1,900,544 B (OTA slot A)
+ota_0,    app,  ota_0,   0x20000,  0x1D0000,
+# 1.8125 MB / 1,900,544 B (OTA slot B)
+ota_1,    app,  ota_1,   0x1F0000, 0x1D0000,
+# 96 KB / 98,304 B (inactive SPA slot)
+spa_b,    data, spiffs,  0x3C0000, 0x18000,
+# 96 KB / 98,304 B (active/factory SPA slot; listed last for uploadfs)
+spa_a,    data, spiffs,  0x3D8000, 0x18000,

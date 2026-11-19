@@ -3,6 +3,11 @@
 //  BRMesh Controller — build configuration
 // ============================================================================
 
+// --- Firmware version (single source of truth: FirmwareVersion.h) -----------
+// Bump FIRMWARE_VERSION / kBoardModel THERE per phase — see that file's rules.
+// Reported by /api/status, the boot banner, and Improv device info.
+#include "FirmwareVersion.h"
+
 // --- Defaults (NVS seed values; saved settings win — see settings.*) --------
 #define DEFAULT_NAME      "brmesh"
 #define DEFAULT_WIFI_SSID ""        // empty = not configured yet -> Improv at boot

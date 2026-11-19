@@ -446,11 +446,13 @@ void MeshController::saveLights() {
     if (!l.isRegistered) continue;
     String idk = "id" + String(i);
     String nmk = "nm" + String(i);
+    String mck = "mac" + String(i);
     String t0k = "t0" + String(i);
     String t1k = "t1" + String(i);
     String nuk = "num" + String(i);
     prefs.putString(idk.c_str(), l.id.c_str());
     prefs.putString(nmk.c_str(), l.name.c_str());
+    prefs.putString(mck.c_str(), l.address.c_str());
     prefs.putInt(t0k.c_str(), l.type[0]);
     prefs.putInt(t1k.c_str(), l.type[1]);
     prefs.putInt(nuk.c_str(), l.number);
@@ -466,12 +468,14 @@ void MeshController::loadLights() {
   for (int i = 0; i < n; i++) {
     String idk = "id" + String(i);
     String nmk = "nm" + String(i);
+    String mck = "mac" + String(i);
     String t0k = "t0" + String(i);
     String t1k = "t1" + String(i);
     String nuk = "num" + String(i);
     LightDevice l;
     l.id = prefs.getString(idk.c_str(), "").c_str();
     l.name = prefs.getString(nmk.c_str(), "Light").c_str();
+    l.address = prefs.getString(mck.c_str(), "").c_str();   // empty on pre-mac entries
     l.type[0] = (uint8_t)prefs.getInt(t0k.c_str(), 0);
     l.type[1] = (uint8_t)prefs.getInt(t1k.c_str(), 0);
     l.number = (uint8_t)prefs.getInt(nuk.c_str(), 0);

@@ -22,6 +22,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <Network.h>
+#include <ESPmDNS.h>
 #include <ImprovWiFiBLE.h>
 
 #include "config.h"
@@ -29,6 +30,8 @@
 #include "console.h"
 #include "settings.h"
 #include "statusled.h"
+#include "web/WebLog.h"
+#include "web/WebServer.h"
 
 // ============================================================================
 //  App instances: one engine + its serial driver + Improv (provisioning).
@@ -107,7 +110,7 @@ void launchProvisioning() {
 
   // setDeviceInfo() initializes NimBLE and starts the Improv advertising.
   g_improv.setDeviceInfo(ImprovTypes::ChipFamily::CF_ESP32,
-                         improvName(), "1.0", improvName());
+                         improvName(), FIRMWARE_VERSION, improvName());
   Serial.println("Improv: ready. Serial console still available (type 'help').");
 }
 
@@ -118,6 +121,7 @@ void setup() {
   Serial.begin(115200);
   delay(250);
   Serial.println("\n=== BRMesh Controller ===");
+  LOGF("fw: %s (%s)", FIRMWARE_VERSION, kBoardModel);
 
   ledInit();
   ledSet(LED_BOOT);
@@ -137,8 +141,8 @@ void setup() {
     WiFi.setHostname(s.name.c_str());
     WiFi.mode(WIFI_STA);
     WiFi.begin(s.ssid.c_str(), s.pass.c_str());
-    Serial.printf("WiFi: connecting to '%s' (timeout %lu s)...\n",
-                  s.ssid.c_str(), WIFI_CONNECT_TIMEOUT_MS / 1000);
+    LOGF("WiFi: connecting to '%s' (timeout %lu s)...",
+         s.ssid.c_str(), (unsigned long)WIFI_CONNECT_TIMEOUT_MS / 1000);
     const uint32_t t0 = millis();
     while (millis() - t0 < WIFI_CONNECT_TIMEOUT_MS) {
       if (WiFi.status() == WL_CONNECTED) break;
@@ -146,7 +150,8 @@ void setup() {
     }
     wifiUp = (WiFi.status() == WL_CONNECTED);
     if (wifiUp) {
-      Serial.printf("WiFi: connected, IP %s\n", WiFi.localIP().toString().c_str());
+      LOGF("WiFi: connected, IP %s (rssi %d)", WiFi.localIP().toString().c_str(),
+           (int)WiFi.RSSI());
       ledSet(LED_WIFI);
     }
   }
@@ -161,15 +166,57 @@ void setup() {
   g_mesh.begin();
   {
     const uint8_t* k = g_mesh.key();
-    Serial.printf("Mesh key: %02X %02X %02X %02X\n", k[0], k[1], k[2], k[3]);
+    LOGF("Mesh key: %02X %02X %02X %02X", k[0], k[1], k[2], k[3]);
   }
 
-  // 2) Restore previously-registered lights (no re-keying).
+  // 2) Network shell (Phase 1, BRIDGE_PLAN §5: mDNS -> httpd -> loadLights):
+  //    <name>.local on the LAN + the HTTP/WS server, then the light list.
+  if (MDNS.begin(s.name.c_str())) {
+    MDNS.addService("http", "tcp", 80);
+    LOGF("mDNS: serving http on %s.local", s.name.c_str());
+  } else {
+    LOGF("mDNS: registration failed (http still up on the LAN IP)");
+  }
+  if (!webServerInit())
+    LOGF("web: HTTP server failed to start — console-only mode");
+
+  // 3) Restore previously-registered lights (no re-keying).
   g_mesh.loadLights();
 
-  Serial.println("Ready. Use the serial console for discovery (type 'help').");
+  Serial.println("Ready. Web: http://" + String(s.name.c_str()) + ".local  —  serial console: 'help'.");
   Serial.println("To key the bulb, power-cycle it, then type 'bootcatch 12'.");
   g_console.banner();
+}
+
+// ============================================================================
+//  WiFi watchdog — the boot STA flow runs only ONCE. The driver's own
+//  background reconnect gives up and the board then sits with a dead network
+//  until a manual reboot (observed 2026-11-19), so loop() owns reconnection:
+//  rate-limited (30 s), logged to the ring (visible on /ws/log), LED ERR
+//  while retrying, back to WIFI on recovery.
+// ============================================================================
+static unsigned long s_wifiLastTry = 0;
+static bool          s_wifiRetryArmed = false;
+
+static void wifiWatchdog() {
+  if (WiFi.status() == WL_CONNECTED) {
+    if (s_wifiRetryArmed) {
+      s_wifiRetryArmed = false;
+      ledSet(LED_WIFI);
+      LOGF("WiFi: reconnected, IP %s (rssi %d)",
+           WiFi.localIP().toString().c_str(), (int)WiFi.RSSI());
+    }
+    return;
+  }
+
+  if (millis() - s_wifiLastTry < 30000UL) return;   // rate-limit
+  s_wifiLastTry = millis();
+  s_wifiRetryArmed = true;
+  ledSet(LED_ERR);
+  LOGF("WiFi: link lost — reconnecting…");
+  const Settings s = loadSettings();   // fresh creds (console `set` may have changed them)
+  WiFi.disconnect();
+  WiFi.begin(s.ssid.c_str(), s.pass.c_str());
 }
 
 void loop() {
@@ -182,6 +229,9 @@ void loop() {
     }
     return;   // engine stays offline for the whole provisioning boot
   }
+
+  // Network health first: a dead STA means a dead web shell + no HA later.
+  wifiWatchdog();
 
   // Engine: run any queued background scan (console 'scan' / 'bootcatch').
   g_mesh.loop();

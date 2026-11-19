@@ -1,9 +1,10 @@
 # CLAUDE.md — BRMesh → Home Assistant controller (ESP32-S3)
 
 ESP32-S3 firmware that bridges **BRGD/BRMesh BLE lights** into **Home Assistant**
-over MQTT. Currently **Phase 0** (single build, one env): BLE FastCon engine +
-serial console + WiFi STA with **Improv BLE** provisioning. No web UI, no
-MQTT/HA yet (Phase 1 / Phase 3).
+over MQTT. **Phases 0–1 done** (single build, one env): BLE FastCon engine +
+serial console + WiFi STA with **Improv BLE** provisioning + **web shell**
+(HTTP `/api/*` + WS `/ws/log`, SPA-ready LittleFS). No SPA yet (Phase 2), no
+MQTT/HA yet (Phase 3).
 
 **Read the siblings before touching code — they are the sources of truth:**
 - [protocol.md](protocol.md) — the FastCon air protocol, byte-level (framing,
@@ -20,7 +21,8 @@ toolchain.
 - [src/main.cpp](src/main.cpp) — thin app shell: setup/loop + §5 boot gate (NVS creds → STA → Improv)
 - [src/settings.{h,cpp}](src/settings.h) — NVS-backed settings (creds, name, MQTT) · [src/statusled.{h,cpp}](src/statusled.h) — WS2812 status LED (native `rgbLedWrite`)
 - [src/protocol.{h,cpp}](src/protocol.h) — FastCon byte codec (unchanged) · [src/light.h](src/light.h) — shared `LightDevice`
-- [src/web/](src/web/) — untracked Phase-1 scaffolding, NOT in the build filter yet
+- [src/FirmwareVersion.h](src/FirmwareVersion.h) — single source of truth for the version (bump per phase — lora-relay convention)
+- [src/web/](src/web/) — web shell: `WebLog` ring buffer · `ApiHttp` helpers · `WebServer` (httpd, routes, SPA handler, `/ws/log`)
 
 ---
 
@@ -90,6 +92,7 @@ rawwake [sec]         WAKE broadcast + every frame (proved WAKE triggers identit
 wake [sec] | wakephone [sec]                  broadcast-only debug
 prov                  clear saved WiFi creds + reboot into Improv provisioning
 hostname [name]       show / set device name (DHCP hostname; NVS 'name')
+showcfg | set <k> <v> config: name/ssid/pass/mhost/mport/muser/mpass (NVS)
 ```
 
 **Provisioning boot:** on a boot where WiFi is unprovisioned/failing, the mesh
@@ -105,9 +108,18 @@ commands above are rejected ("engine offline (provisioning mode)"). `prov`,
   native USB: `-DARDUINO_USB_MODE=1 -DARDUINO_USB_CDC_ON_BOOT=1`.
 - **One board, one build** (`waveshare_esp32_s3_zero`). `build_src_filter` in
   [platformio.ini](platformio.ini) scopes it to `main.cpp` + `protocol.cpp` +
-  `MeshController.cpp` + `console.cpp` + `settings.cpp` + `statusled.cpp`
-  (+ the shared `light.h`); the untracked `web/` scaffolding stays OUT until
-  Phase 1. There is no separate POC / `ENABLE_WIFI=0` build — the flag is gone.
+  `MeshController.cpp` + `console.cpp` + `settings.cpp` + `statusled.cpp` +
+  `web/*` (+ the shared `light.h`). There is no separate POC / `ENABLE_WIFI=0`
+  build — the flag is gone.
+- **Partitions (lora-relay shape, 4 MB):** dual OTA slots (1.81 MB each) + A/B
+  spiffs SPA slots (96 KB; `spa_a` active — `board_build.filesystem_partition`).
+  FS partitions must be **`data, spiffs`** — this core's LittleFS does NOT
+  mount a `data, fat` partition (verified; lora-relay uses spiffs).
+  `pio run -t uploadfs` flashes the SPA slot (Phase 2).
+- **Verify from this host:** the board is `192.168.40.51` on VLAN 40 — mDNS
+  (`.local`) does NOT cross VLANs here. Use the bare hostname:
+  `curl http://brmesh/api/status` (resolves via the `nammane.home.arpa`
+  search domain) or the IP directly.
 - **Serial port:** `/dev/ttyACM0` or `/dev/ttyACM1` — **it can swap on
   power-cycles** (`ls /dev/ttyACM*`; override with `ESP_SERIAL_PORT=...`).
   `monitor_port` in platformio.ini is stale.
@@ -149,9 +161,14 @@ calls; on a denial, **stop and report**, don't retry verbatim.
 - **DO NOT** loop/retry network calls or pin toggles — stop and report on denial.
 - **No `ENABLE_WIFI` flag** — it was removed when the two builds collapsed into one
   (one board, one firmware). The HA lib (`dawidchyrzynski/home-assistant-integration`)
-  is commented out of [platformio.ini](platformio.ini) and re-added in **Phase 3**;
-  `web/` stays out of `build_src_filter` until **Phase 1**. Do NOT re-introduce the
-  build-flag split.
+  is commented out of [platformio.ini](platformio.ini) and re-added in **Phase 3**.
+  Do NOT re-introduce the build-flag split.
+- **Firmware version:** single source of truth is
+  [src/FirmwareVersion.h](src/FirmwareVersion.h) (`FIRMWARE_VERSION` +
+  `kBoardModel`, current release only — no changelog). Bump it there when a
+  phase ships; the boot banner, Improv device info, and `/api/status`
+  (`fw`/`board`) all read it. Phase 2's `build_spa.py` bakes it into the SPA
+  (lora-relay regex) for the mismatch check.
 - `protocol.md` is the wire-format source of truth — don't copy frame layout back
   here.
 - **Core hostname quirk (verified on hardware):** `WiFi.setHostname()` only

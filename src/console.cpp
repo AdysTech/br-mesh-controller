@@ -2,6 +2,7 @@
 #include "console.h"
 #include "MeshController.h"
 #include "settings.h"
+#include <Network.h>
 #include <string.h>
 #include <stdlib.h>
 #include <ctype.h>
@@ -32,6 +33,8 @@ void Console::banner() {
   Serial.println("  clear                remove all known lights (list + NVS; keeps key)");
   Serial.println("  prov                 clear saved WiFi creds + reboot into Improv");
   Serial.println("  hostname [name]      show / set device name (DHCP hostname, 1-15 chars)");
+  Serial.println("  showcfg              show all saved settings (passwords masked)");
+  Serial.println("  set <k> <v>          save a setting — keys: name ssid pass mhost mport muser mpass");
   Serial.println("  --------------------------");
 }
 
@@ -168,6 +171,61 @@ void Console::handle(const char* line) {
       if (!isalnum((unsigned char)c) && c != '-') { Serial.println("only letters, digits, '-' allowed"); return; }
     setDeviceName(nm.c_str());
   }
+  else if (strcmp(argv[0], "showcfg") == 0) {
+    const Settings s = loadSettings();
+    Serial.printf("  name    : %s\n", s.name.c_str());
+    Serial.printf("  ssid    : %s\n",
+                  s.ssid.empty() ? "(empty — boots into Improv)" : s.ssid.c_str());
+    Serial.printf("  pass    : %s\n", s.pass.empty() ? "(empty)" : "****");
+    Serial.printf("  mhost   : %s\n", s.mqttHost.c_str());
+    Serial.printf("  mport   : %d\n", s.mqttPort);
+    Serial.printf("  muser   : %s\n", s.mqttUser.empty() ? "(none)" : s.mqttUser.c_str());
+    Serial.printf("  mpass   : %s\n", s.mqttPass.empty() ? "(none)" : "****");
+  }
+
+  else if (strcmp(argv[0], "set") == 0) {
+    if (argc < 3) {
+      Serial.println("usage: set <name|ssid|pass|mhost|mport|muser|mpass> <value>");
+      Serial.println("       ('showcfg' to see current values)");
+      return;
+    }
+    const char* k = argv[1];
+    const std::string v(argv[2]);
+    Settings s = loadSettings();
+    bool wifiTouched = false;
+    if (strcmp(k, "name") == 0) {
+      if (v.size() < 1 || v.size() > 15) { Serial.println("name must be 1-15 chars"); return; }
+      for (char c : v)
+        if (!isalnum((unsigned char)c) && c != '-') { Serial.println("only letters, digits, '-' allowed"); return; }
+      s.name = v;
+    } else if (strcmp(k, "ssid") == 0 || strcmp(k, "sid") == 0) { s.ssid = v; wifiTouched = true; }
+    else if (strcmp(k, "pass") == 0)                            { s.pass = v; wifiTouched = true; }
+    else if (strcmp(k, "mhost") == 0 || strcmp(k, "mqtt") == 0) { s.mqttHost = v; }
+    else if (strcmp(k, "mport") == 0) {
+      int port = atoi(argv[2]);
+      if (port < 1 || port > 65535) { Serial.println("port must be 1-65535"); return; }
+      s.mqttPort = (uint16_t)port;
+    } else if (strcmp(k, "muser") == 0) { s.mqttUser = v; }
+    else if (strcmp(k, "mpass") == 0)  { s.mqttPass = v; }
+    else {
+      Serial.println("unknown key — one of: name ssid pass mhost mport muser mpass");
+      return;
+    }
+    saveSettings(s);
+    if (strcmp(k, "name") == 0) {
+      // apply to the live netif too (same core quirk as `hostname`)
+      NetworkInterface* def = Network.getDefaultInterface();
+      if (def && def->setHostname(s.name.c_str()))
+        Serial.printf("name '%s' saved + applied\n", s.name.c_str());
+      else
+        Serial.printf("name '%s' saved — active from the next boot\n", s.name.c_str());
+    } else if (wifiTouched) {
+      Serial.printf("%s saved — press RESET to apply (STA reconnects with the new creds)\n", k);
+    } else {
+      Serial.printf("%s saved\n", k);
+    }
+  }
+
   else if (strcmp(argv[0], "wake") == 0) mesh_.wakeFor((argc >= 2) ? atoi(argv[1]) : 3);
   else if (strcmp(argv[0], "wakephone") == 0) mesh_.wakePhone((argc >= 2) ? atoi(argv[1]) : 3);
 
