@@ -1,8 +1,8 @@
 // ============================================================================
 //  WebServer (see WebServer.h) — esp_http_server startup, routes, SPA, /ws/log.
 //
-//  The httpd config + WS dispatch model mirror the proven lora-relay build on
-//  this core (frame-struct WS API, client id = httpd_req_to_sockfd):
+//  The httpd config + WS dispatch model mirror lora-relay's build on this
+//  core (frame-struct WS API, client id = httpd_req_to_sockfd):
 //    - esp_http_server itself does the 101 handshake.
 //    - The WS handler is invoked when the CLIENT SENDS A FRAME — not at
 //      handshake. So the client must send a hello frame, the handler consumes
@@ -26,15 +26,37 @@
 #include "settings.h"
 #include "MeshController.h"
 #include "ApiHttp.h"
+#include "ApiLights.h"
+#include "ApiSystem.h"
 #include "WebLog.h"
 
 extern MeshController g_mesh;   // app shell (main.cpp)
 
 httpd_handle_t g_webServer = nullptr;
 
+// The SPA build tag this board is SERVING (data/spa.version, written by
+// tools/build_spa.py; the same FIRMWARE_VERSION the firmware was built from).
+static char s_spaVersion[32] = "";
+const char *webSpaVersion() { return s_spaVersion; }
+
+static void loadSpaVersion() {
+  s_spaVersion[0] = 0;
+  if (!LittleFS.exists("/spa.version")) return;
+  File f = LittleFS.open("/spa.version", "r");
+  if (!f) return;
+  size_t n = f.read((uint8_t *)s_spaVersion, sizeof(s_spaVersion) - 1);
+  f.close();
+  if (n > 0) {
+    s_spaVersion[n] = 0;
+    char *nl = strchr(s_spaVersion, '\n');
+    if (nl) *nl = 0;
+    LOGF("web: serving SPA build %s", s_spaVersion);
+  }
+}
+
 // ----------------------------------------------------------------------------
 //  WS client registry — socket fds, lazily pruned when a send to one fails.
-//  (Same shape as the proven lora-relay WebSocketPush.cpp.)
+//  (Same shape as lora-relay's WebSocketPush.cpp.)
 // ----------------------------------------------------------------------------
 static int      s_wsFds[WEB_MAX_WS_CLIENTS] = {};
 static int      s_wsCount = 0;
@@ -173,6 +195,7 @@ static esp_err_t apiStatusHandler(httpd_req_t *req) {
       "\"lights\":%d,"
       "\"scanning\":%s,"
       "\"fw\":\"%s\","
+      "\"spa\":\"%s\","
       "\"board\":\"%s\","
       "\"uptime_s\":%lu,"
       "\"heap_free\":%lu}",
@@ -183,6 +206,7 @@ static esp_err_t apiStatusHandler(httpd_req_t *req) {
       g_mesh.lightCount(),
       g_mesh.isScanning() ? "true" : "false",
       FIRMWARE_VERSION,
+      jsonEscape(webSpaVersion()).c_str(),
       kBoardModel,
       (unsigned long)(millis() / 1000),
       (unsigned long)ESP.getFreeHeap());
@@ -199,21 +223,35 @@ static esp_err_t apiLightsHandler(httpd_req_t *req) {
   std::string out = "[";
   for (size_t i = 0; i < lights.size(); i++) {
     const LightDevice &l = lights[i];
-    char item[256];
+    // mode drives the UI picker: white (on, no colour), rgb, or ct.
+    const char *mode =
+        l.colorMode == 2 ? "ct" : (l.colorMode == 1 ? "rgb" : "white");
+    char item[400];
     snprintf(item, sizeof(item),
         "%s{\"n\":%u,"
         "\"name\":\"%s\","
         "\"id\":\"%s\","
         "\"mac\":\"%s\","
         "\"type\":\"%02X%02X\","
-        "\"features\":[\"on_off\",\"brightness\",\"rgb\"],"
-        "\"believed_state\":null}",
+        "\"features\":[\"on_off\",\"brightness\",\"rgb\",\"ct\"],"
+        "\"min_kelvin\":2700,"
+        "\"max_kelvin\":6000,"
+        "\"believed_state\":{\"on\":%s,"
+        "\"brightness\":%u,"
+        "\"rgb\":[%u,%u,%u],"
+        "\"ct\":%u,"
+        "\"mode\":\"%s\"}}",
         i ? "," : "",
         (unsigned)l.number,
         jsonEscape(l.name.c_str()).c_str(),
         jsonEscape(l.id.c_str()).c_str(),
         jsonEscape(l.address.c_str()).c_str(),
-        l.type[0], l.type[1]);
+        l.type[0], l.type[1],
+        l.on ? "true" : "false",
+        (unsigned)l.brightness,
+        (unsigned)l.rgbR, (unsigned)l.rgbG, (unsigned)l.rgbB,
+        (unsigned)l.ct,
+        mode);
     out += item;
   }
   out += "]";
@@ -315,15 +353,19 @@ bool webServerInit() {
   // LittleFS is the SPA's home (Phase 2 writes index.html.gz into it).
   // NOTE: on this core (pioarduino) the mountable subtype is 'spiffs' (0x40),
   // not 'fat' — same partition table shape as lora-relay (see partitions.csv).
-  if (!LittleFS.begin(true)) {
-    Serial.println("web: LittleFS mount FAILED — SPA path will use the embedded fallback");
+  // Mount by PARTITION LABEL — the one-arg begin() picks a core-default label
+  // that is not in our table (mount fails → SPA path falls back to the inline
+  // HTML). lora-relay's shape: (readOnly, path, maxOpen, label).
+  if (!LittleFS.begin(true, "/littlefs", 10, "spa_a")) {
+    LOGE("web: LittleFS mount FAILED — SPA path will use the embedded fallback");
   } else {
-    Serial.printf("web: LittleFS up  (%lu KB total, %lu KB free)\n",
-                  (unsigned long)(LittleFS.totalBytes() / 1024),
-                  (unsigned long)((LittleFS.totalBytes() - LittleFS.usedBytes()) / 1024));
+    LOGF("web: LittleFS up  (%lu KB total, %lu KB free)",
+         (unsigned long)(LittleFS.totalBytes() / 1024),
+         (unsigned long)((LittleFS.totalBytes() - LittleFS.usedBytes()) / 1024));
+    loadSpaVersion();
   }
 
-  // lora-relay-proven config values.
+  // lora-relay's config values.
   httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
   cfg.server_port = 80;
   cfg.max_uri_handlers = 32;
@@ -335,7 +377,7 @@ bool webServerInit() {
 
   if (httpd_start(&g_webServer, &cfg) != ESP_OK) {
     g_webServer = nullptr;
-    Serial.println("web: httpd_start failed");
+    LOGE("web: httpd_start failed");
     return false;
   }
 
@@ -343,16 +385,18 @@ bool webServerInit() {
   if (registerRoute(g_webServer, "/api/status", HTTP_GET, apiStatusHandler, false) != ESP_OK) goto fail;
   if (registerRoute(g_webServer, "/api/lights", HTTP_GET, apiLightsHandler, false) != ESP_OK) goto fail;
   if (registerRoute(g_webServer, "/ws/log", HTTP_GET, wsLogHandler, true) != ESP_OK) goto fail;
+  if (!registerLightRoutes(g_webServer)) goto fail;
+  if (!registerSystemRoutes(g_webServer)) goto fail;
   if (registerRoute(g_webServer, "/", HTTP_GET, indexHandler, false) != ESP_OK) goto fail;
   if (registerRoute(g_webServer, "/*", HTTP_GET, indexHandler, false) != ESP_OK) goto fail;
 
-  Serial.println("web: HTTP up on :80  (GET /  /api/status  /api/lights  WS /ws/log)");
+  LOGF("web: HTTP up on :80  (SPA + /api/* + WS /ws/log)");
   return true;
 
 fail:
   httpd_stop(g_webServer);
   g_webServer = nullptr;
-  Serial.println("web: route registration failed");
+  LOGE("web: route registration failed");
   return false;
 }
 
@@ -360,7 +404,7 @@ void webServerShutdown() {
   if (!g_webServer) return;
   httpd_stop(g_webServer);
   g_webServer = nullptr;
-  Serial.println("web: HTTP down");
+  LOGF("web: HTTP down");
 }
 
 bool webServerIsRunning() { return g_webServer != nullptr; }

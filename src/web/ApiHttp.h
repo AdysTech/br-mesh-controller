@@ -19,3 +19,14 @@ String apiQuery(httpd_req_t *req, const char *key);
 /// Escape a C string for embedding inside a JSON string literal
 /// (quotes, backslashes, control chars).
 std::string jsonEscape(const char *s);
+
+// --- tiny flat-JSON body readers (no JSON lib on this board) ----------------
+/// Extract an integer "key":<num> from a small JSON body; -1 when absent.
+int apiJsonInt(const String &body, const char *key);
+
+/// Extract a string "key":"<text>" from a small JSON body; "" when absent.
+std::string apiJsonString(const String &body, const char *key);
+
+/// Extract a boolean "key":true|false from a small JSON body; false when
+/// absent (or not true).
+bool apiJsonBool(const String &body, const char *key);

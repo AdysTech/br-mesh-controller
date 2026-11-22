@@ -7,10 +7,9 @@
 // NeoPixel library.
 //
 // Colour order: this is a standard WS2812B, i.e. physically GRB. The board
-// variant claims RGB_BUILTIN_LED_COLOR_ORDER=RGB, which swaps R and G —
-// verified on the real board (intended red showed as teal, intended green as
-// red). So we pass the standard GRB order explicitly and keep plain R/G/B
-// values in the state table below.
+// variant claims RGB_BUILTIN_LED_COLOR_ORDER=RGB, which would swap R and G,
+// so we pass the standard GRB order explicitly and keep plain R/G/B values in
+// the state table below.
 #include "statusled.h"
 
 #ifdef RGB_BUILTIN

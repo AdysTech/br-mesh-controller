@@ -59,10 +59,46 @@ std::string jsonEscape(const char *s) {
   return out;
 }
 
+// Find "key" (as a JSON key) in the body; returns position just past the
+// closing quote of the key, or npos.
+static size_t jsonKeyPos(const String &body, const char *key) {
+  return body.indexOf("\"" + String(key) + "\"");
+}
+
+int apiJsonInt(const String &body, const char *key) {
+  size_t p = jsonKeyPos(body, key);
+  if (p == -1) return -1;
+  p = body.indexOf(':', p);
+  if (p == -1) return -1;
+  return atoi(body.substring(p + 1).c_str());
+}
+
+std::string apiJsonString(const String &body, const char *key) {
+  size_t p = jsonKeyPos(body, key);
+  if (p == -1) return "";
+  p = body.indexOf(':', p);
+  if (p == -1) return "";
+  size_t q = body.indexOf('"', p + 1);
+  if (q == -1) return "";
+  size_t e = body.indexOf('"', q + 1);
+  if (e == -1) return body.substring(q + 1).c_str(); // unterminated string — take the rest
+  return body.substring(q + 1, e - (q + 1)).c_str();
+}
+
+bool apiJsonBool(const String &body, const char *key) {
+  size_t p = jsonKeyPos(body, key);
+  if (p == -1) return false;
+  p = body.indexOf(':', p);
+  if (p == -1) return false;
+  return body.indexOf("true", p + 1) == p + 1 || body.indexOf("true", p + 2) == p + 2;
+}
+
 String apiQuery(httpd_req_t *req, const char *key) {
   static char qbuf[512];
   qbuf[0] = 0;
-  if (!httpd_req_get_url_query_str(req, qbuf, sizeof(qbuf))) return String();
+  // httpd_req_get_url_query_str returns esp_err_t (ESP_OK == 0), so test
+  // against ESP_OK — NOT `!ret`, which inverts it (0 == success).
+  if (httpd_req_get_url_query_str(req, qbuf, sizeof(qbuf)) != ESP_OK) return String();
   // qbuf looks like "n=2&x=1"
   String q(qbuf);
   int start = 0;

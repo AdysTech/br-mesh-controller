@@ -1,4 +1,8 @@
-// Log ring buffer + broadcast (see WebLog.h).
+// Leveled log ring buffer + broadcast (see WebLog.h). P2.11.
+//
+// Every line is level-gated on g_logLevel, then time-stamped ("t=<uptime>s "),
+// printed to Serial, pushed into the ring, and broadcast to /ws/log clients.
+// The gate happens before any formatting so a suppressed line costs nothing.
 #include "WebLog.h"
 #include <freertos/FreeRTOS.h>
 #include <freertos/portmacro.h>
@@ -13,6 +17,10 @@ static char ring[LOG_RING][LOG_LEN];
 static int ringHead = 0;      // next write slot
 static int ringCount = 0;
 static portMUX_TYPE ringMux = portMUX_INITIALIZER_UNLOCKED;
+
+// P2.11 — runtime log level (0=quiet, 1=normal, 2=verbose). NOT persisted;
+// resets to the compile-time LOG_LEVEL on reboot.
+volatile int8_t g_logLevel = LOG_LEVEL;
 
 // Defined in WebServer.cpp (single build — the web stack always links).
 extern bool webWsHasLogClients(void);
@@ -36,25 +44,40 @@ static void tailLine(int age, char *out) {
   taskEXIT_CRITICAL(&ringMux);
 }
 
-void logLine(const std::string &line) {
-  Serial.println(line.c_str());
-  pushLine(line.c_str(), line.size());
-  if (webWsHasLogClients()) wsLogBroadcast(line.c_str());
+// Shared sink: Serial + ring + web broadcast (no level gate — callers gate).
+static void emitLine(const char *line, size_t n) {
+  Serial.println(line);
+  pushLine(line, n);
+  if (webWsHasLogClients()) wsLogBroadcast(line);
 }
 
-void blog(const char *fmt, ...) {
-  char buf[192];
-  va_list ap;
-  va_start(ap, fmt);
-  int n = vsnprintf(buf, sizeof(buf), fmt, ap);
-  va_end(ap);
+// Level-gated, time-stamped printf sink. `level` is the MINIMUM level at
+// which the line prints: 0=error (always), 1=info, 2=debug.
+static void vlog(int level, const char *fmt, va_list ap) {
+  if ((int)g_logLevel < level) return;            // gate first — zero cost when off
+  char body[176];
+  int n = vsnprintf(body, sizeof(body), fmt, ap);
   if (n < 0) n = 0;
-  if (n >= (int)sizeof(buf)) n = (int)sizeof(buf) - 1;
-  buf[n] = 0;
+  if (n >= (int)sizeof(body)) n = (int)sizeof(body) - 1;
+  body[n] = 0;
 
-  Serial.println(buf);
-  pushLine(buf, n);
-  if (webWsHasLogClients()) wsLogBroadcast(buf);
+  char line[192];
+  int len = snprintf(line, sizeof(line), "t=%lus ", (unsigned long)(millis() / 1000UL));
+  if (len < 0) len = 0;
+  snprintf(line + len, sizeof(line) - len, "%s", body);
+  emitLine(line, strlen(line));
+}
+
+void blogE(const char *fmt, ...) { va_list ap; va_start(ap, fmt); vlog(0, fmt, ap); va_end(ap); }
+void blog(const char *fmt, ...)  { va_list ap; va_start(ap, fmt); vlog(1, fmt, ap); va_end(ap); }
+void blogD(const char *fmt, ...) { va_list ap; va_start(ap, fmt); vlog(2, fmt, ap); va_end(ap); }
+
+// A ready-made line (no format specifiers), time-stamped at the info level.
+void logLine(const std::string &line) {
+  char out[192];
+  int len = snprintf(out, sizeof(out), "t=%lus %.*s",
+                     (unsigned long)(millis() / 1000UL), (int)line.size(), line.c_str());
+  emitLine(out, len < 0 ? 0 : (size_t)len);
 }
 
 std::string logTail(int n) {

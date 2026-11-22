@@ -1,10 +1,10 @@
 # CLAUDE.md — BRMesh → Home Assistant controller (ESP32-S3)
 
 ESP32-S3 firmware that bridges **BRGD/BRMesh BLE lights** into **Home Assistant**
-over MQTT. **Phases 0–1 done** (single build, one env): BLE FastCon engine +
+over MQTT. **Phases 0–2 done** (single build, one env): BLE FastCon engine +
 serial console + WiFi STA with **Improv BLE** provisioning + **web shell**
-(HTTP `/api/*` + WS `/ws/log`, SPA-ready LittleFS). No SPA yet (Phase 2), no
-MQTT/HA yet (Phase 3).
+(HTTP `/api/*` + WS `/ws/log`) + **Svelte SPA** (Lights/Config/Console/Info,
+26 kB gz, e2e-verified 2026-11-19). No MQTT/HA yet (Phase 3).
 
 **Read the siblings before touching code — they are the sources of truth:**
 - [protocol.md](protocol.md) — the FastCon air protocol, byte-level (framing,
@@ -22,7 +22,8 @@ toolchain.
 - [src/settings.{h,cpp}](src/settings.h) — NVS-backed settings (creds, name, MQTT) · [src/statusled.{h,cpp}](src/statusled.h) — WS2812 status LED (native `rgbLedWrite`)
 - [src/protocol.{h,cpp}](src/protocol.h) — FastCon byte codec (unchanged) · [src/light.h](src/light.h) — shared `LightDevice`
 - [src/FirmwareVersion.h](src/FirmwareVersion.h) — single source of truth for the version (bump per phase — lora-relay convention)
-- [src/web/](src/web/) — web shell: `WebLog` ring buffer · `ApiHttp` helpers · `WebServer` (httpd, routes, SPA handler, `/ws/log`)
+- [src/web/](src/web/) — web shell: `WebLog` ring buffer · `ApiHttp` helpers · `WebServer` (httpd, routes, SPA handler, `/ws/log`) · `ApiLights` (scan + light ops) · `ApiSystem` (config/provision/reset/raw)
+- [frontend/](frontend/) — Svelte 5 SPA (Phase 2): `src/pages/` (Lights · Config · Console · Info), `src/lib/` (api · ws · router), `e2e/` (puppeteer smoke)
 
 ---
 
@@ -40,6 +41,15 @@ toolchain.
 - Expose **each light individually** as an HA entity. No group APIs.
 - **Persistent boot:** key + light list in NVS (`brmesh` namespace); on boot,
   restore them (no re-keying) and key **only new** factory-keyed bulbs.
+- **Bulb reset = the boot-time pairing window (no physical reset).** A bulb *persists*
+  its key across reboots but re-enters a pairing window on **every** boot: WAKE heard
+  in that window → it accepts a new key (SET_KEY); no WAKE → it keeps its stored key.
+  So (re)keying a bulb = **reboot it + WAKE on the air** (`scan`) — and there is **no
+  no-air "re-add"** (reboot + `scan` recovers a lost list entry). protocol.md §2.9.
+- **Mesh relaying (the forward bit).** Bulbs don't ACK but they **re-broadcast** a
+  command they hear — that relay is what carries one controller broadcast across the
+  mesh. Header `p[0]` bit 7 (0x80) is the **forward/relay flag**: CONTROL goes out
+  fwd=1, WAKE/SET_KEY fwd=0. protocol.md §2.8.
 
 ## 2. Proven state → the standing rules it gave us
 
@@ -56,7 +66,9 @@ detect → key → control → NVS persistence across reboots. Don't re-derive i
   [slicedAdvertiseScan()](src/MeshController.cpp) (advertise burst → scan burst loop);
   never the concurrent Bluedroid pattern.
 - **Bulbs on air:** factory OUI `f2:72:70:e8`, type `2A A8`. Test target = `70:e7`
-  (on the Tasmota power switch). `2a:e6` / `0b:ed` are **not** test targets — ignore.
+  (on the Tasmota power switch, can be controlled by claude). `2a:e6` / `0b:ed` are
+  addable/controllable too — just not used as test targets.
+
 - **Next:** the bridge per [BRIDGE_PLAN.md](BRIDGE_PLAN.md).
 
 ## 3. Discovery / keying (the proven catch recipe)
@@ -69,13 +81,13 @@ only while WAKE is on the air. Proven recipe:
 3. wait ~2 s → `Power ON` — bulb boots *into* the ongoing WAKE with the full
    window left to advertise
 
-Driver: [tools/scan_catch.py](tools/scan_catch.py). **NimBLE can't advertise and
+**NimBLE can't advertise and
 scan at once** (the ESP32 controller drops the advertiser when the scan starts),
 so `scan` uses [slicedAdvertiseScan()](src/MeshController.cpp) — a WAKE/SET_KEY advertise
 burst → scan burst loop — instead of the old concurrent Bluedroid pattern. `wantDuplicates=true`
 still matters: the bulb interleaves bare beacons with identity frames and dedup
 drops them. Keying (`addLight`) time-slices the same way. If the NVS light list is
-ever lost: `readd <mac> [num]`.
+ever lost: **reboot + `scan`** re-keys/re-confirms it (protocol.md §2.9).
 
 ## 4. Serial console (115200 baud)
 
@@ -84,12 +96,9 @@ ever lost: `readd <mac> [num]`.
 ```
 list                  known lights            key                   current mesh key
 sel <n>               target light            on/off/br/ct/rgb ... control (see protocol.md §2.5)
-readd <mac> [num]     re-register a keyed bulb (no air traffic — list recovery)
 scan [sec=5]          discovery + key new bulbs (use 12+ with a mid-scan power-cycle)
-bootcatch [sec=12]    WAKE + concurrent scan (run while power-cycling a bulb)
 raw [sec]             unfiltered per-frame hex dump (debug)
 rawwake [sec]         WAKE broadcast + every frame (proved WAKE triggers identity)
-wake [sec] | wakephone [sec]                  broadcast-only debug
 prov                  clear saved WiFi creds + reboot into Improv provisioning
 hostname [name]       show / set device name (DHCP hostname; NVS 'name')
 showcfg | set <k> <v> config: name/ssid/pass/mhost/mport/muser/mpass (NVS)
@@ -142,15 +151,34 @@ calls; on a denial, **stop and report**, don't retry verbatim.
 ## 6. Tools (tools/, all pyserial + env-driven)
 
 - [tools/esp_serial.py](tools/esp_serial.py) — plumbing: `boot [sec]`, `cmd <text> [sec]`.
-- [tools/scan_catch.py](tools/scan_catch.py) — **the proven one**: `scan 12` + early power-cycle.
-- [tools/raw_catch.py](tools/raw_catch.py), [tools/rawwake_catch.py](tools/rawwake_catch.py) —
-  raw manufacturer-frame dumps; the field path for reverse-engineering a new bulb model.
 - [tools/staged_capture.py](tools/staged_capture.py) — ENTER-driven staged passive capture
   (hunt driver for the phone's one-shot group frames; `scanstop` ends a stage).
   Capture logs land in `tools/capture_*.log`.
 - [tools/decode_fastcon.py](tools/decode_fastcon.py) — **the FastCon decoder**: inverts
   protocol.cpp's encode pipeline (preamble restore, LFSR de-whiten seed `0x25`), reads
-  the command TYPE off a captured payload without needing the command key.
+  the command TYPE off a captured payload without needing the command key. Modes:
+  `decode_fastcon.py <hex...>` (one payload), `--key AABBCCDD` (explicit mesh key),
+  `--file cap.log` (auto-recover key + distinct payloads), and `--relay cap.log`
+  (per-frame table + fwd/seq summaries + the **relay-pair hunt** — same type/i2/seq
+  seen with a flipped forward bit or 2 checksums = evidence of bulb re-broadcast).
+
+## 6b. SPA build + E2E (Phase 2)
+
+- **Build:** `cd frontend && npm run build` → `vite` inlines JS+CSS into one
+  `html/index.html`; `tools/build_spa.py` gzips it to `data/index.html.gz` +
+  writes `data/spa.version`. `pio run --target upload` / `uploadfs` flash
+  firmware + SPA. Board serves `data/index.html.gz` with `Content-Encoding: gzip`.
+- **E2E:** `frontend/e2e/smoke.mjs` — puppeteer against the cached
+  `chrome-headless-shell` (lora-relay's harness). Loads the SPA, asserts no
+  page/console errors + all 4 pages render + one light-toggle round-trip, then
+  (with a registered bulb) exercises the P2.10 controls **end-to-end against
+  the board**: colour-wheel drag → `believed_state.rgb`, white-LED CT slider →
+  `believed_state.mode=ct`, and a refresh restoring believed state (no white
+  box) — each a single board-bound action, asserting the board's OWN
+  `/api/lights` `believed_state` moved (UI → POST → controller → GET).
+  `E2E_APP_URL=… node e2e/smoke.mjs` (default `http://brmesh`).
+  **Run this after any SPA change** — it is the blank-page regression guard
+  AND the NFR-07 ship gate.
 
 ## 7. Standing rules / gotchas
 
@@ -183,3 +211,11 @@ calls; on a denial, **stop and report**, don't retry verbatim.
   `RGB_BUILTIN_LED_COLOR_ORDER=RGB` (verified: intended red showed as teal).
   Use `rgbLedWriteOrdered(RGB_BUILTIN, LED_COLOR_ORDER_GRB, r, g, b)` — see
   [src/statusled.cpp](src/statusled.cpp).
+- **Svelte 5: never name a variable `state` (or `$state`'s target) in a runes file.**
+  With a `state` binding in scope, `$state(...)` compiles as a legacy `$` store
+  access instead of the rune → runtime `store_invalid_shape`, blank page
+  (caught 2026-11-19: `function state(l)` in LightsPage). Name helpers `st`, `opt`,
+  etc. — not `state`/`$state`-adjacent names.
+- **`httpd_req_get_url_query_str` returns `esp_err_t` (`ESP_OK == 0`).**
+  The success check is `!= ESP_OK`, NOT `!ret` (the old inverted check made
+  `?n=` silently empty — every light op 400'd). See [src/web/ApiHttp.cpp](src/web/ApiHttp.cpp).

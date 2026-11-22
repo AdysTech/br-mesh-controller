@@ -24,9 +24,13 @@
 # usage:
 #   decode_fastcon.py 6d b6 43 ...             # one captured payload (after F0 FF)
 #   decode_fastcon.py --key 36383739 6d ...    # one payload + explicit mesh key
-#   decode_fastcon.py --file cap.txt           # batch: auto-recover key, fully decode
+#   decode_fastcon.py --file cap.txt           # batch: auto-recover key, distinct payloads
+#   decode_fastcon.py --relay cap.txt          # per-frame table + fwd/seq summaries +
+#                                              # relay-pair hunt (same type/i2/seq seen
+#                                              # with a flipped forward bit or 2 checksums)
 import sys
-from collections import Counter
+import re
+from collections import Counter, defaultdict
 
 FACTORY = [0x5e, 0x36, 0x7b, 0xc4]  # protocol::DEFAULT_KEY
 SEED = 0x25
@@ -161,22 +165,112 @@ def decode(payload, key=None, preamble=PREAMBLE, quiet=False):
     return h
 
 
+def parse_log(path):
+    """Return [(ts, mac, payload)] for every FastCon (F0 FF) frame in a capture log.
+
+    ts/mac come from the staged_capture line shape
+    `[HH:MM:SS.mmm] t=NNNs RAW <mac> mfg(N): <hex>`; each is "" when a line
+    lacks that prefix, so this still works on a bare `mfg(N): <hex>` dump."""
+    ts_rx = re.compile(r"\[([^\]]*)\]")
+    mac_rx = re.compile(r"RAW ([0-9a-f:]{17})")
+    out = []
+    for line in open(path).read().splitlines():
+        if "mfg(" not in line:
+            continue
+        b = [int(x, 16) for x in line.split("mfg(", 1)[1].split("):", 1)[1].split()]
+        if len(b) < 2 or b[0] != 0xF0 or b[1] != 0xFF:
+            continue
+        ts = ts_rx.search(line)
+        mac = mac_rx.search(line)
+        out.append((ts.group(1) if ts else "", mac.group(1) if mac else "", b[2:]))
+    return out
+
+
+def decode_frame(payload, key=None):
+    """One payload -> (body, header, data, ln), or None if the frame is truncated."""
+    body = full_body(payload)
+    if body is None:
+        return None
+    h = header(list(body))
+    data = plaintext_data(list(body), key) if key else None
+    pt_head = [body[i] ^ FACTORY[i & 3] for i in range(4)]
+    ln = cmd_len(pt_head, data) if data is not None else None
+    return body, h, data, ln
+
+
+def relay_analysis(path, key=None):
+    """Per-frame table + forward/seq summaries + the relay-pair hunt.
+
+    The hunt is the point of the mesh-relay question: the SAME (type, i2, seq)
+    seen with >1 forward bit, or the same command body seen with 2 different
+    checksums, is direct evidence that bulbs re-broadcast (relay) a command
+    rather than each originating its own — the header seq stays put while the
+    checksum/forward flip per re-broadcaster (protocol.md §2.8)."""
+    frames = parse_log(path)
+    print("FastCon (F0 FF) frames: %d  |  distinct MACs: %d"
+          % (len(frames), len(set(m for _, m, _ in frames if m))))
+    bodies = [full_body(p) for _, _, p in frames]
+    bodies = [b for b in bodies if b is not None]
+    if key is None:
+        key = recover_key(bodies) if bodies else None
+    print("recovered mesh key: %s" % (hexs(key) if key else "(none)"))
+
+    # per-frame table (condensed): time, mac, type, fwd, i2, seq, cksum, command
+    print("\n%-13s %-18s %-6s %-3s %-3s %-5s %-6s  %s"
+          % ("time", "mac", "type", "fwd", "i2", "seq", "cksum", "command"))
+    decoded = []
+    for ts, mac, p in frames:
+        d = decode_frame(p, key)
+        if d is None:
+            continue
+        _, h, data, ln = d
+        cmd = classify(h["type"], ln, data[:ln]) if (ln is not None and key) else ""
+        decoded.append((ts, mac, h))
+        print("%-13s %-18s %-6s %-3d %-3d %-5s %-6s  %s"
+              % (ts, mac, h["type_name"], h["forward"], h["i2"],
+                 "0x%02x" % h["seq"], "0x%02x" % h["checksum"], cmd))
+
+    # summaries
+    print("\nBy (type, fwd):")
+    g = Counter((h["type_name"], h["forward"]) for _, _, h in decoded)
+    for (ty, fwd), v in sorted(g.items()):
+        print("  %-8s fwd=%d : %d" % (ty, fwd, v))
+
+    print("\nBy (type, i2, fwd):")
+    g2 = Counter((h["type_name"], h["i2"], h["forward"]) for _, _, h in decoded)
+    for (ty, i2, fwd), v in sorted(g2.items()):
+        print("  %-8s i2=%d fwd=%d : %d" % (ty, i2, fwd, v))
+
+    # relay-pair hunt: same (type, i2, seq) with >1 distinct forward bit or checksum
+    print("\nRelay-pair hunt — (type,i2,seq) with >1 fwd or >1 checksum:")
+    byseq = defaultdict(lambda: {"fwd": set(), "cksum": set(), "mac": set()})
+    for ts, mac, h in decoded:
+        e = byseq[(h["type_name"], h["i2"], h["seq"])]
+        e["fwd"].add(h["forward"])
+        e["cksum"].add(h["checksum"])
+        e["mac"].add(mac)
+    found = 0
+    for k, e in sorted(byseq.items()):
+        if len(e["fwd"]) > 1 or len(e["cksum"]) > 1:
+            found += 1
+            print("  %-8s i2=%d seq=0x%02x  fwd=%s  cksum=%s  macs=%d"
+                  % (k[0], k[1], k[2], sorted(e["fwd"]),
+                     ["0x%02x" % c for c in sorted(e["cksum"])], len(e["mac"])))
+    if not found:
+        print("  (none — no same-seq fwd flip or checksum mutation seen)")
+
+
 def main():
     args = sys.argv[1:]
     key = None
     if args and args[0] == "--key":
         key = [int(args[1][i:i + 2], 16) for i in range(0, 8, 2)]
         args = args[2:]
+    if args and args[0] == "--relay":
+        relay_analysis(args[1], key=key)
+        return
     if args and args[0] == "--file":
-        text = open(args[1]).read()
-        frames = []
-        for line in text.splitlines():
-            if "mfg(" not in line:
-                continue
-            hexstr = line.split("mfg(", 1)[1].split("):", 1)[1]
-            b = [int(x, 16) for x in hexstr.split()]
-            if len(b) >= 2 and b[0] == 0xF0 and b[1] == 0xFF:
-                frames.append(b[2:])
+        frames = [p for _, _, p in parse_log(args[1])]
         if not frames:
             print("  (no F0 FF frames in %s)" % args[1])
             return
@@ -205,7 +299,7 @@ def main():
             print("    x%-4d type=%-8s data=%s   ->  %s" % (n, h["type_name"], shown, desc))
         return
     if not args:
-        print("usage: decode_fastcon.py <hexbytes...> [--key aabbccdd] | --file <log>")
+        print("usage: decode_fastcon.py <hexbytes...> [--key aabbccdd] | --file <log> | --relay <log>")
         return
     payload = [int(x, 16) for x in args]
     print("=== payload (%d b) ===" % len(payload))

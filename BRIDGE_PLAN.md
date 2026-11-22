@@ -24,6 +24,7 @@
 12. [Implementation Phases](#12-implementation-phases)
 12. [Appendix A — Proven Baseline (do not re-litigate)](#appendix-a--proven-baseline)
 13. [Appendix B — Toolchain](#appendix-b--toolchain)
+14. [Appendix C — Finding F-CT: WW/CW colour-temperature model](#appendix-c--finding-f-ct--wwcw-colour-temperature-model)
 
 ---
 
@@ -40,10 +41,12 @@
 | FR-05 | State shall be **believed state** — the ESP tracks the last command sent per light (broadcast-only bulbs, no readback) | Mandatory |
 | FR-06 | A raw FastCon packet-capture path shall exist on serial **and** in the web console, triggerable from the UI (field path for new bulb models) | Mandatory |
 | FR-07 | Key, light list, and all config (name, WiFi, MQTT) shall persist in NVS across reboots; no re-keying on power-cycle | Mandatory |
-| FR-08 | The serial console (POC command set: `list`, `sel`, `on/off/ct/rgb`, `scan`, `raw`, `readd`…) shall keep working in bridge mode | Mandatory |
-| FR-09 | Colour-temperature control (bulbs advertise type `2A A8`) | Later (Phase 5) |
+| FR-08 | The serial console (POC command set: `list`, `sel`, `on/off/ct/rgb`, `scan`, `raw`…) shall keep working in bridge mode | Mandatory |
+| FR-09 | Colour + white control (bulbs advertise type `2A A8`) — **the on-hand bulbs are RGBW**: one op `0x72`, one 8-byte payload, two mutually-exclusive modes — **RGB** (`d[3]=B,d[4]=R,d[5]=G`, white off) **or** **WW/CW white crossfade** (`d[6]=CW, d[7]=255−CW`, RGB off), not a single-axis CT ([protocol.md](protocol.md) §2.5b): the UI ships a colour/white control in Phase 2 (P2.10), and the firmware now encodes the correct unified `0x72` wire (RGB or CW/WW crossfade, `d[2]=0xff`) — **Finding F-CT fixed 2026-11-20**, kelvin unit adopted 2026-11-22 (Appendix C): `ct` is a kelvin label (2700–6000 K) end-to-end, split to the WW/CW crossfade only at TX. Remaining: the fine kelvin→byte mid-curve (LUT) is Phase 5 (P5.2) | Phase 2 UI (P2.10) + correct wire + kelvin unit (done); fine mid-curve LUT Phase 5 (P5.2) |
 | FR-10 | "All lights" **virtual selection** (ESP-owned fan-out entity, every keyed bulb) — §7.3 L2 | Later (Phase 5) |
 | FR-15 | **Native room groups (§7.3 L1):** a bulb is assigned to a physical room at keying; whole-room command = one FastCon group frame. **Verify-first** on the `0x21` assign + type-3 group frames (not yet in protocol.md); until verified, a room group is a virtual selection (L2) | Later (Phase 5, gated on verification) |
+| FR-16 | **State convergence:** a bulb is broadcast-only and may have missed a command (unpowered when we sent it), so the controller shall re-transmit each light's last known state on a fixed cadence (default ~10 s, tunable) so the air converges to what the user set; off must stay off (never re-send a colour frame to an off bulb); skipped while scanning (radio is time-sliced) | Phase 2 (P2.9) |
+| FR-17 | **Observable logging:** a leveled logger (error/info/debug) with a settable level and per-line uptime timestamps so the operator can read what happened and how long it took; quiet by default, detailed on demand — modeled on lora-relay's `Shared.h` logger | Phase 2 (P2.11) |
 | FR-11 | Firmware / LittleFS OTA via the web UI | Optional |
 | FR-12 | A light entry shall be deletable from the web UI (and console); its HA entity shall be removed from Home Assistant | Mandatory |
 | FR-13 | A light shall be **renamable** from the web UI (and console), modeled on zigbee2mqtt `friendly_name`: the HA entity's name updates in place (no orphan entity), and the rename persists | Mandatory |
@@ -59,6 +62,7 @@
 | NFR-04 | No key extraction from the Android app; the ESP is the key originator | Project rule |
 | NFR-05 | No network/pin retry loops — one attempt, stop and report on denial | Project rule |
 | NFR-06 | `protocol.cpp` stays stack-agnostic and byte-identical to the proven reference | Untouched |
+| NFR-07 | **The SPA is ship-gated by UI-based (browser) tests** — `frontend/e2e/smoke.mjs` (puppeteer against the cached headless shell): no page/console errors, all four pages render, one light on/off round-trip, and each new control exercised end-to-end — colour wheel and white-LED (CT) slider drive the board's own `believed_state` (UI → POST → controller → GET) and a refresh restores it (P2.8). Any SPA change must pass the e2e before it ships; a new control ships with its e2e case | Test gate |
 
 ### 1.3 Hardware Assumptions
 
@@ -287,8 +291,8 @@ serves the last N lines on connect so a reconnect loses nothing.
 - **Removal (FR-12):** `del <n>` (console) / `DELETE /api/light/{n}` removes the NVS
   entry, saves, and unpublishes that light's discovery topic (empty payload) so the HA
   entity disappears. Note: the physical bulb keeps its key — it still obeys our
-  broadcast — it is simply no longer represented; re-addable any time via
-  `readd <mac> [n]`.
+  broadcast — it is simply no longer represented; re-addable any time
+  (reboot the bulb + `scan`).
 
 ### 7.3 Group Model (two layers)
 
@@ -402,11 +406,11 @@ scan/keying states (§5) are unchanged.
 
 - The factory-identity frame is emitted only in the seconds after power-up, and
   only while WAKE is on the air — proven catch recipe in CLAUDE.md §3
-  (`scan 12` + early Tasmota power-cycle), driver [tools/scan_catch.py](tools/scan_catch.py).
+  (`scan 12` + early power-cycle of the bulb).
 - NimBLE drops the advertiser when a scan starts → everything time-slices:
   WAKE/SET_KEY advertise burst → scan burst loop.
 - `wantDuplicates=true` matters: bulbs interleave bare beacons with identity frames.
-- Recovery without air traffic: `readd <mac> [num]` (NVS list repair only).
+- **List recovery:** a lost entry needs no special path — reboot + `scan` re-keys/re-confirms it (protocol.md §2.9); there is no no-air `readd`.
 - **Runtime rule:** at most one scan at a time; scan start is guarded (console,
   web, HA button all hit the same single entry point in `MeshController`).
 
@@ -506,15 +510,53 @@ drop-test pending (toggle the AP).
 |------|-------------|
 | P2.1 | `frontend/` scaffold — Svelte + Vite + `vite-plugin-singlefile` + gzip; `tools/build_spa.py` pre-build action writing `index.html.gz` into LittleFS; embedded default page if the file is missing |
 | P2.2 | Status/landing page — name, mode, IP, RSSI, MQTT link, lights count, fw, uptime (from `/api/status` + `/ws/log` status frames) |
-| P2.3 | Lights page — per bulb: on/off, brightness slider, RGB picker, CT placeholder (Phase 5), **rename** (inline edit, FR-13), **delete** (FR-12, with confirmation); believed state, live-updated over WS |
+| P2.3 | Lights page — per bulb: on/off, brightness slider, RGB picker, colour-temp slider (kelvin, P2.10), **rename** (inline edit, FR-13), **delete** (FR-12, with confirmation); believed state, live-updated over WS |
 | P2.4 | Scan page — start with duration, live frame/identity count from the log stream, result list |
 | P2.5 | Config page — name, **MQTT host/port/user/pass** (primary way to configure the broker — Phase 3 depends on it), "Provision via BLE", factory reset (confirmation); saving MQTT triggers an immediate connect attempt, no reboot |
 | P2.6 | Console page — live log over `/ws/log`, raw-capture trigger (`POST /api/raw`), per-frame hex view |
 | P2.7 | Hash routing (`#/status`, `#/lights`, …); WS event-driven updates, poll demoted to a reconnect safety net |
+| P2.8 | **Believed state per bulb (FR-05):** the controller records the last intent — `{on, brightness, rgb, ct, colorMode}` — in `state`/`brightness`/`rgb`/`colorTemp`, persists it with the light in NVS (so it survives reboot), and returns it as `believed_state` on `GET /api/lights` (currently hardcoded `null`). The UI restores each swatch/slider from it — **fixes the "white box on refresh"** | Phase 2 follow-on (P2.8) |
+| P2.9 | **State convergence re-transmit (FR-16):** a `loop()` cadence (default 10 s, tunable via console/`set`) re-sends each light's last known state so a bulb that missed a command converges. **Off stays off** (re-send `off`, never a colour frame); on → re-send the active colour (`rgb` or `ct`) + brightness. Skipped while scanning (radio time-sliced). Feeds the same `singleControl` seam; no direct BLE | Phase 2 follow-on (P2.9) |
+| P2.10 | **Colour picker (FR-09, RGBW):** replace the `<input type="color">` rectangle with a BRMesh-app-style **colour wheel** (hue/saturation) for the RGB channel **plus a colour-temperature slider (kelvin, 2700–6000 K)** for the separate white LED (these bulbs are RGBW). Drive `rgb` and `ct` (kelvin) through the existing `POST /api/light?n=` | Phase 2 follow-on (P2.10) |
+| P2.11 | **Leveled logger (FR-17):** replace raw `Serial.printf` with a leveled logger (`error`/`info`/`debug`) — settable level (console `set loglevel` + default) and a `t=<uptime>s` per-line prefix (so durations are visible), relayed to the `/ws/log` ring. Modeled on lora-relay's `Shared.h` logger (`LOG_ERROR/NORMAL/VERBOSE` + runtime `g_logLevel`) | Phase 2 follow-on (P2.11) |
+| P2.12 | **UI-test coverage (NFR-07):** `frontend/e2e/smoke.mjs` exercises the new controls end-to-end against the board — colour wheel (drag → `believed_state.rgb`), white-LED CT slider (input → `believed_state.mode=ct`), and believed-state restore on refresh (White/CT stays active, no white box) — each as a single board-bound action. The idle-poll guarantee (the Lights page adds no per-second `/api/status` poller of its own; the App shell keeps its intentional 15 s meta poll) is a code-level invariant, not a network assertion. Every SPA change ships only green | Phase 2 follow-on (P2.12) |
 
 **Deliverable:** Every operator task — provision, scan, key, control, configure,
 diagnose — is doable from the browser; serial remains for firmware bring-up.
 
+**Status — DONE (2026-11-19).** Shipped as one build (fw + spa 1.2.0), verified
+on the board:
+- Page order per the request: **Lights (landing), Config, Console, Info** —
+  P2.4 scan is folded into the Lights page (one fewer tab, control-first).
+- 26 kB gzipped single file (96 kB partition — 73% headroom).
+- Full surface: light card (switch / brightness / RGB / rename / forget),
+  scan panel (start · stop · live log tail), Config (device + MQTT +
+  provision + factory-reset, masked secrets), Console (raw capture + live
+  board log), Info (build match check + board KV).
+- E2E: `frontend/e2e/smoke.mjs` (lora-relay's puppeteer harness, cached
+  chrome-headless-shell) — **7/7 pass against the board** incl. one light
+  toggle round-trip; screenshots in `e2e/shots/`.
+- Two bugs caught by the e2e run: `function state()` shadowed Svelte 5's
+  `$state` rune (→ `store_invalid_shape`, blank page), and `apiQuery()`
+  inverted the `ESP_OK == 0` success check (→ `?n=` never parsed).
+
+**Status — P2.8–P2.12 (added 2026-11-20): implemented; single build is green
+(65.1 % flash). Board flash + e2e run pending the serial port / a physical
+reset.** Follow-on asks layered on the Phase 2 surface:
+- **P2.7 idle-poll fix (done):** the Lights page no longer polls `/api/status`
+  on a 2.5 s timer — it polls only while `scanning`, and leans on the WS
+  `logStream` for the live tail when idle (zero idle HTTP).
+- **P2.8 believed state** (FR-05): the controller tracks each bulb's last intent
+  (`on`/`brightness`/`rgb`/`ct`), persists it, and returns it as
+  `believed_state` — the UI stops showing a white box on refresh.
+- **P2.9 re-transmit** (FR-16): a ~10 s convergence loop re-sends the last known
+  state so a bulb that missed a command (unpowered) catches up; off stays off.
+- **P2.10 colour picker** (FR-09, RGBW): BRMesh-app-style colour wheel + a
+  colour-temperature (white) slider, replacing the rectangle.
+- **P2.11 leveled logger** (FR-17): `error`/`info`/`debug`, settable level,
+  `t=<uptime>s` prefix (lora-relay `Shared.h` model).
+- **P2.12 UI tests** (NFR-07): the e2e gate extended to the new controls; the
+  ship gate is the e2e, not "it looked fine."
 
 ### Phase 3: HA Bridge
 
@@ -544,7 +586,7 @@ Prove both directions with the on-hand factory-new stock (FR-12).
 | P4.1 | **Add proof:** power up a factory-new bulb, start a scan (HA button / web / serial) → it is keyed, added to the NVS list, and its HA entity appears live (dynamic discovery) and is controllable — no reboot |
 | P4.2 | **Multi-add proof:** repeat with a second bulb — light list grows, `lights registered` sensor tracks the count, each entity independent |
 | P4.3 | **Remove proof:** delete a light from the web Lights page (confirmation) → `DELETE /api/light/{n}` → NVS saved + discovery unpublished → the HA entity disappears; console `del <n>` gives the same result |
-| P4.4 | **Re-add:** `readd <mac> [n]` restores an entry — the physical bulb keeps its key (removal deletes the record, not the keying) and still answers |
+| P4.4 | **Re-add:** reboot the bulb + `scan` restores its entry — the physical bulb keeps its key (removal deletes the record, not the keying) and still answers |
 | P4.5 | **Persistence:** power-cycle after add + remove → the light list is exactly right: added bulbs remain, removed one does not come back |
 
 **Deliverable:** A factory-new bulb: scan → keyed → in HA → controllable, all
@@ -570,8 +612,8 @@ full colour control, and software-updatable UI/firmware.
 ## Appendix A — Proven Baseline
 
 - POC **complete** on `70:e7:f2:72:70:e8` (light #1, key `09 90 1D D8`):
-  detect → key → control (physically verified) → NVS persistence across reboots,
-  plus `readd` list recovery.
+  detect → key → control (physically verified) → NVS persistence across reboots
+  (a lost list entry recovers via reboot + `scan`).
 - [protocol.cpp](src/protocol.cpp) is byte-identical to the proven community
   reference (protocol.md §3) — the active scan sees the bulbs and the
   detection/keying logic matches the real captured factory frame.
@@ -586,8 +628,7 @@ full colour control, and software-updatable UI/firmware.
 
 - `pio` / `python`: `/home/rao/.platformio/penv/bin/pio`, `.../penv/bin/python`.
 - Build + flash: `pio run -e waveshare_esp32_s3_zero --target upload`.
-- Serial helpers: [tools/esp_serial.py](tools/esp_serial.py) (`boot`, `cmd`);
-  catch driver: [tools/scan_catch.py](tools/scan_catch.py) (proven).
+- Serial helpers: [tools/esp_serial.py](tools/esp_serial.py) (`boot`, `cmd`).
 - Port: `/dev/ttyACM0` or `/dev/ttyACM1` — **can swap on power-cycle**
   (`ls /dev/ttyACM*`; override `ESP_SERIAL_PORT`). DTR/RTS does **not** reset
   this board — RESET button or USB power-cycle only.
@@ -595,3 +636,62 @@ full colour control, and software-updatable UI/firmware.
   **one request per state change, never loop/retry**; on a denial stop and report.
 - Standing rules: no key extraction; no network/pin retry loops; `protocol.md`
   is the wire-format source of truth.
+
+## Appendix C — Finding F-CT: op `0x72` = RGB **or** WW/CW white (unified)
+
+**Date:** 2026-11-20. **Status: FIXED (2026-11-20); kelvin unit adopted 2026-11-22.** [MeshController::applyLight](src/MeshController.cpp) encodes the WW/CW crossfade from a kelvin value (`k` clamped 2700–6000 → `CW = (k−2700)*255/3300`, `WW = 255 − CW`) and both `colorTemp`/`rgb` send `d[2]=0xff` — the retired 14-bit split is gone. `ct` is now a kelvin label end-to-end (API, console, `believed_state`), stored as one 16-bit NVS value and split to the two white channels only at TX. The API/console/`believed_state`/e2e contract **did** change to kelvin (see §C.5). The fine kelvin→byte mid-curve (LUT) stays Phase 5 (P5.2).
+
+### C.1 What we found
+The on-hand bulbs are **RGBW**: a full RGB group **plus** a two-LED white (cool-white CW + warm-white WW), all driven by **one op `0x72`, one 8-byte payload, two mutually-exclusive modes**. That is **not** the single-axis 14-bit colour-temp the firmware currently encodes, and not a separate `colorTemp` op distinct from `rgb` — the app uses the same `0x72` command and switches modes by which channel group it sets. This is validated against the **app's own commands** (decoded under the app's key `35 30 32 32`; all frames checksum-close), captured 2026-11-20 on `70:e7…`.
+
+Payload layout: `72 nn ff B R G WW CW` — `d[3]=B`, `d[4]=R`, `d[5]=G`, `d[6]=WW` (warm-white), `d[7]=CW` (cool-white); RGB mode zeroes the white pair, white mode zeroes the RGB triple.
+
+**White (colour-temp) mode — `B=R=G=0`, `WW = 255 − CW` (linear crossfade):** channel order `d[6]=warm, d[7]=cool` is hardware-verified on the physical bulb (2026-11-20) — the original kelvin↔byte association was recorded reversed.
+
+| app colour temp | data bytes (d[0..7]) | d[6] WW (warm) | d[7] CW (cool) |
+|---|---|---|---|
+| 2700 K (warm end) | `72 nn ff 00 00 00 ff 00` | `0xff` (WW full) | `0x00` |
+| ~4100 K (middle) | `72 nn ff 00 00 00 87 78` | `0x87` | `0x78` |
+| 6000 K (cool end) | `72 nn ff 00 00 00 00 ff` | `0x00` | `0xff` (CW full) |
+
+**RGB mode — `CW=WW=0`, byte order `d[3]=B, d[4]=R, d[5]=G` (app-validated):**
+
+| colour | d[3] B | d[4] R | d[5] G |
+|---|---|---|---|
+| green | 00 | 00 | ff |
+| blue | ff | 00 | 00 |
+| magenta | ff | ff | 00 |
+| cyan | ff | 00 | ff |
+| lime (DIY) | 00 | 62 | ff |
+
+Secondary (minor): the app sends `d[2]` = `0xff` (on|max-brightness) in **every** frame (RGB and white) while the shipped code sends `d[2]` = `0x80` — a brightness-bits difference, not the core issue (the exact role of `d[2]` is still inferred). Full detail + open items: [protocol.md](protocol.md) §2.5b.
+
+### C.2 Why the shipped encoding is wrong
+[MeshController::colorTemp](src/MeshController.cpp) encodes `d[6] = t & 127; d[7] = (t >> 8) & 127` — a **single 14-bit value split across the two bytes**. That (a) 7-bit-masks both channels (max `0x7F`), so it **cannot express either app endpoint** (both need a full `0xff` channel), and (b) treats the two channels as **one axis** when they are a **crossfade** (`WW = 255 − CW`). Net effect: our CT slider never lands on the app's colour temperatures. Two related mismatches: the shipped `colorTemp`/`rgb` both send `d[2] = 0x80` where the app sends `0xff`; and `rgb()` is otherwise byte-order correct (`d[3]=B, d[4]=R, d[5]=G`) but was never validated against the air — it now is.
+
+### C.3 Affected surfaces (all assume the retired single-axis model)
+| surface | what it assumes | location |
+|---|---|---|
+| `colorTemp(n, uint16_t t)` — the 14-bit split | single-axis CT | [src/MeshController.cpp:99-108](src/MeshController.cpp#L99) |
+| `colorTemp(uint8_t, uint16_t)` signature | `uint16_t` kelvin parameter | [src/MeshController.h:67](src/MeshController.h#L67) |
+| `ct <0-32767>` command + help text | 15-bit CT range | [src/console.cpp:22](src/console.cpp#L22), [121-125](src/console.cpp#L121) |
+| `CT_MAX = 16383`, slider 0–100 → CT_MAX | 14-bit ceiling | [frontend/src/lib/ColorPicker.svelte:21](frontend/src/lib/ColorPicker.svelte#L21) |
+| `{"ct":N}` passthrough (no rescale) | CT integer | [src/web/ApiLights.cpp:104-105](src/web/ApiLights.cpp#L104) |
+| `believed_state.ct` / `colorMode=2` | single CT value | [src/light.h](src/light.h) |
+| CT-slider e2e case | single-axis restore | [frontend/e2e/smoke.mjs](frontend/e2e/smoke.mjs) |
+| `colour temp` table row | retired encoding | [protocol.md §2.5](protocol.md) |
+
+> Note (2026-11-22): the kelvin unit (2700–6000 K) now supersedes these surfaces — `ct` is a kelvin label end-to-end and stored as one 16-bit NVS value. The table above is the 2026-11-20 as-found snapshot.
+
+### C.4 Reclaim status (NOT a blocker — already ours)
+`70:e7…` is **already reclaimed to our key `09 90 1D D8`** and in our control. The Nov-20 capture that decoded under the app's key `35 30 32 32` was the **app's own broadcast, sent under the app's key** — that is what makes it decode under that key; it proves nothing about which key the bulb holds. The bulb carries *our* key, so the app's continued broadcasts are **inert** (the bulb decrypts the data region under our key, the app's frames fail the §2.1 checksum and are ignored). So **our board can drive `70:e7…` directly — no reclaim step is needed** before verifying the new white-channel encoding on hardware. (The app-key rotation note in protocol.md §2.7 still stands as general guidance for any bulb the app *has* claimed and we have *not* yet reclaimed.)
+
+### C.5 Open design decisions (choose before touching code)
+**Now settled by the captures:** RGB and white are **mutually exclusive** — one `0x72` command carries either the RGB triple **or** the CW/WW pair, never both. So the model is two modes of one op, not two independent values that coexist. That removes the "coexistence" branch of the decision and confirms the UI needs a **mode toggle** (colour wheel ↔ white slider), matching the app.
+
+**Resolved (2026-11-20 white-channel fix; kelvin unit adopted 2026-11-22):**
+1. **Slider semantics — kelvin.** `colorTemp(n, k)` takes a kelvin value (`k` 2700 warm → 6000 cool) and maps it linearly **at TX** to `CW = (k−2700)*255/3300`, `WW = 255 − CW`; `k` is stored as one 16-bit `ct` and split to the two white channels only in `applyLight`. 
+2. **Kelvin range — the control unit.** 2700–6000 K is now the API/console/`believed_state` unit (the app's display label promoted to the control field); it is **not** on the air — only the 0–255 WW/CW pair is (protocol.md §2.5b).
+3. **Parameter model — kelvin end-to-end.** `colorTemp(n, k)`, console `ct <2700-6000>`, `{"ct":<kelvin>}`, and `believed_state.ct` are all kelvin now; `believed_state` keeps its `mode` (colour | white) flag + `ct`/`rgb` values. The UI slider (P2.10) sends/reads kelvin. The fine kelvin→byte mid-curve (LUT) stays Phase 5 (P5.2).
+4. **`d[2]` = `0xff`** — adopted in both `colorTemp` and `rgb` (matches the air).
+5. **Reclaim first — moot.** `70:e7…` is already on our key (C.4); verify the new encoding on it directly.

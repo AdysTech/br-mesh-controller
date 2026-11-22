@@ -4,6 +4,7 @@
 #include <Arduino.h>
 #include <Preferences.h>
 #include "config.h"
+#include "web/WebLog.h"   // leveled logger (P2.11)
 
 static Preferences s_prefs;
 
@@ -29,7 +30,7 @@ Settings loadSettings() {
 
 void saveSettings(const Settings &s) {
   // readOnly MUST be false — with true the put* calls below silently no-op
-  // (proven gotcha, CLAUDE.md §2).
+  // (CLAUDE.md §2).
   s_prefs.begin("brmesh", false);
   s_prefs.putString("name", s.name.c_str());
   s_prefs.putString("ssid", s.ssid.c_str());
@@ -39,7 +40,7 @@ void saveSettings(const Settings &s) {
   s_prefs.putString("muser", s.mqttUser.c_str());
   s_prefs.putString("mpass", s.mqttPass.c_str());
   s_prefs.end();
-  Serial.println("Saved settings to NVS");
+  LOGF("Saved settings to NVS");
 }
 
 void clearWiFiCreds() {
@@ -47,5 +48,5 @@ void clearWiFiCreds() {
   s_prefs.putString("ssid", "");
   s_prefs.putString("pass", "");
   s_prefs.end();
-  Serial.println("Cleared saved WiFi creds from NVS");
+  LOGF("Cleared saved WiFi creds from NVS");
 }

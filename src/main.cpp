@@ -55,7 +55,7 @@ static const char* improvName() {
 // P0.3 — re-entry: console `prov` (later web "Provision via BLE"):
 // clear the saved WiFi creds -> reboot into the Improv branch.
 void requestProvisioning() {
-  Serial.println("prov: clearing saved WiFi creds, rebooting into Improv");
+  LOGF("prov: clearing saved WiFi creds, rebooting into Improv");
   clearWiFiCreds();
   WiFi.persistent(false);   // keep the WiFi driver's own NVS slot out of play
   WiFi.disconnect(true);    // and wipe it if present
@@ -74,10 +74,10 @@ void setDeviceName(const char* name) {
   saveSettings(s);
   NetworkInterface* def = Network.getDefaultInterface();
   if (def && def->setHostname(name)) {
-    Serial.printf("hostname '%s' saved + applied (DHCP lease picks it up at renewal/reconnect)\n", name);
+    LOGF("hostname '%s' saved + applied (DHCP lease picks it up at renewal/reconnect)", name);
     return;
   }
-  Serial.printf("hostname '%s' saved — active from the next boot/connect\n", name);
+  LOGF("hostname '%s' saved — active from the next boot/connect", name);
 }
 
 // Start the Improv BLE service. The brmesh NVS settings are the single
@@ -88,17 +88,17 @@ void launchProvisioning() {
   s_provisioning = true;
   s_provStarted  = millis();
   ledSet(LED_AP);
-  Serial.println("=== Improv provisioning (BLE) ===");
-  Serial.printf("  BLE name : %s\n", improvName());
-  Serial.println("  Phone/PC : open https://www.improv-wifi.com (Chrome/Edge) and scan");
-  Serial.printf("  Window   : %lu s, then reboot to retry\n", PROV_TIMEOUT_MS / 1000);
+  LOGF("=== Improv provisioning (BLE) ===");
+  LOGF("  BLE name : %s", improvName());
+  LOGF("  Phone/PC : open https://www.improv-wifi.com (Chrome/Edge) and scan");
+  LOGF("  Window   : %lu s, then reboot to retry", PROV_TIMEOUT_MS / 1000);
 
   WiFi.persistent(false);
   WiFi.mode(WIFI_STA);
   WiFi.disconnect(true);    // wipe any stale driver-NVS creds
 
   g_improv.setCustomConnectWiFi([](const char* ssid, const char* pass) -> bool {
-    Serial.printf("Improv: creds received (ssid=%s) — saving to NVS\n", ssid);
+    LOGF("Improv: creds received (ssid=%s) — saving to NVS", ssid);
     Settings s = loadSettings();
     s.ssid = ssid;
     s.pass = pass ? pass : "";
@@ -111,7 +111,7 @@ void launchProvisioning() {
   // setDeviceInfo() initializes NimBLE and starts the Improv advertising.
   g_improv.setDeviceInfo(ImprovTypes::ChipFamily::CF_ESP32,
                          improvName(), FIRMWARE_VERSION, improvName());
-  Serial.println("Improv: ready. Serial console still available (type 'help').");
+  LOGF("Improv: ready. Serial console still available (type 'help').");
 }
 
 // ============================================================================
@@ -120,7 +120,7 @@ void launchProvisioning() {
 void setup() {
   Serial.begin(115200);
   delay(250);
-  Serial.println("\n=== BRMesh Controller ===");
+  LOGF("=== BRMesh Controller ===");
   LOGF("fw: %s (%s)", FIRMWARE_VERSION, kBoardModel);
 
   ledInit();
@@ -133,11 +133,10 @@ void setup() {
   bool wifiUp = false;
   if (!s.ssid.empty()) {
     WiFi.persistent(false);   // the driver's own NVS STA slot must not win
-    // ORDER MATTERS (core quirk, verified on hardware): the core snapshots
-    // the stored name onto the STA netif INSIDE WiFi.mode() —
-    // WiFiGenericClass::mode() -> esp_netif_set_hostname(getHostname()).
-    // WiFi.setHostname() after mode() only writes a static buffer that is
-    // never applied again (symptom: DHCP advertised default esp32s3-<mac>).
+    // ORDER MATTERS: the core copies the stored name onto the STA netif INSIDE
+    // WiFi.mode() (WiFiGenericClass::mode() -> esp_netif_set_hostname()), so
+    // setHostname() must run BEFORE mode() — after that it only writes a static
+    // buffer that is never applied to the netif again.
     WiFi.setHostname(s.name.c_str());
     WiFi.mode(WIFI_STA);
     WiFi.begin(s.ssid.c_str(), s.pass.c_str());
@@ -156,7 +155,7 @@ void setup() {
     }
   }
   if (!wifiUp) {
-    Serial.println("WiFi: not configured or connect failed -> provisioning");
+    LOGF("WiFi: not configured or connect failed -> provisioning");
     launchProvisioning();
     g_console.banner();
     return;   // loop(): console + LED + window timeout only
@@ -180,18 +179,18 @@ void setup() {
   if (!webServerInit())
     LOGF("web: HTTP server failed to start — console-only mode");
 
-  // 3) Restore previously-registered lights (no re-keying).
+  // 3) Restore already-registered lights (no re-keying).
   g_mesh.loadLights();
 
-  Serial.println("Ready. Web: http://" + String(s.name.c_str()) + ".local  —  serial console: 'help'.");
-  Serial.println("To key the bulb, power-cycle it, then type 'bootcatch 12'.");
+  LOGF("Ready. Web: http://%s.local  —  serial console: 'help'.", s.name.c_str());
+  LOGF("To key the bulb, power-cycle it, then type 'scan 12'.");
   g_console.banner();
 }
 
 // ============================================================================
 //  WiFi watchdog — the boot STA flow runs only ONCE. The driver's own
 //  background reconnect gives up and the board then sits with a dead network
-//  until a manual reboot (observed 2026-11-19), so loop() owns reconnection:
+//  until a manual reboot, so loop() owns reconnection:
 //  rate-limited (30 s), logged to the ring (visible on /ws/log), LED ERR
 //  while retrying, back to WIFI on recovery.
 // ============================================================================
@@ -224,7 +223,7 @@ void loop() {
     ledTick();
     g_console.poll();
     if (millis() - s_provStarted > PROV_TIMEOUT_MS) {
-      Serial.println("Improv window expired; rebooting to retry");
+      LOGF("Improv window expired; rebooting to retry");
       ESP.restart();
     }
     return;   // engine stays offline for the whole provisioning boot
@@ -233,7 +232,7 @@ void loop() {
   // Network health first: a dead STA means a dead web shell + no HA later.
   wifiWatchdog();
 
-  // Engine: run any queued background scan (console 'scan' / 'bootcatch').
+  // Engine: run any queued background scan (console 'scan').
   g_mesh.loop();
 
   // Serial console.
