@@ -1,10 +1,11 @@
 # CLAUDE.md — BRMesh → Home Assistant controller (ESP32-S3)
 
 ESP32-S3 firmware that bridges **BRGD/BRMesh BLE lights** into **Home Assistant**
-over MQTT. **Phases 0–2 done** (single build, one env): BLE FastCon engine +
+over MQTT. **Phases 0–3 implemented** (single build, one env): BLE FastCon engine +
 serial console + WiFi STA with **Improv BLE** provisioning + **web shell**
-(HTTP `/api/*` + WS `/ws/log`) + **Svelte SPA** (Lights/Config/Console/Info,
-26 kB gz, e2e-verified 2026-11-19). No MQTT/HA yet (Phase 3).
+(HTTP `/api/*` + WS `/ws/log`) + **Svelte SPA** (Lights/Config/Console/Info) +
+**HA bridge** (standard device-based MQTT discovery, `src/HaBridge.*`; live-broker
+verification pending).
 
 **Read the siblings before touching code — they are the sources of truth:**
 - [protocol.md](protocol.md) — the FastCon air protocol, byte-level (framing,
@@ -18,6 +19,7 @@ toolchain.
 **Code layout — a 3-layer split (keep `main.cpp` lean for the bridge stage):**
 - [src/MeshController.{h,cpp}](src/MeshController.h) — the engine: key + lights + BLE advertise/scan + discovery/keying + NVS persistence
 - [src/console.{h,cpp}](src/console.h) — the serial console driver; consumes a `MeshController&`
+- [src/HaBridge.{h,cpp}](src/HaBridge.h) — Phase 3 HA bridge: one esp-mqtt client, all device-based discovery/state publishing behind it (hub + per-bulb), the `mname` identity (`dev.cu` always derived = `http://<board IP>/`)
 - [src/main.cpp](src/main.cpp) — thin app shell: setup/loop + §5 boot gate (NVS creds → STA → Improv)
 - [src/settings.{h,cpp}](src/settings.h) — NVS-backed settings (creds, name, MQTT) · [src/statusled.{h,cpp}](src/statusled.h) — WS2812 status LED (native `rgbLedWrite`)
 - [src/protocol.{h,cpp}](src/protocol.h) — FastCon byte codec (unchanged) · [src/light.h](src/light.h) — shared `LightDevice`
@@ -188,9 +190,12 @@ calls; on a denial, **stop and report**, don't retry verbatim.
   Start from the map, not from a search. Keep §6 current when you add tooling.
 - **DO NOT** loop/retry network calls or pin toggles — stop and report on denial.
 - **No `ENABLE_WIFI` flag** — it was removed when the two builds collapsed into one
-  (one board, one firmware). The HA lib (`dawidchyrzynski/home-assistant-integration`)
-  is commented out of [platformio.ini](platformio.ini) and re-added in **Phase 3**.
-  Do NOT re-introduce the build-flag split.
+  (one board, one firmware). **Phase 3 HA bridge: standard MQTT device-based
+  discovery** (plain retained JSON, HA ≥ 2026.4 key set — `uniq_id`, `via_device`,
+  `dev.cu`, no `object_id`) over esp-mqtt (ESP-IDF core `esp_mqtt_client`, no
+  third-party lib), per [BRIDGE_PLAN.md](BRIDGE_PLAN.md)
+  §7.2 — the `home-assistant-integration` lib is NOT used (classic per-component
+  discovery). Do NOT re-introduce the build-flag split.
 - **Firmware version:** single source of truth is
   [src/FirmwareVersion.h](src/FirmwareVersion.h) (`FIRMWARE_VERSION` +
   `kBoardModel`, current release only — no changelog). Bump it there when a

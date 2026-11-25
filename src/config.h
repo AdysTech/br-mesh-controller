@@ -24,6 +24,21 @@
 // bulbs that still need keying.
 #define SCAN_DURATION    5
 
+// --- Command queue (Phase 3, BRIDGE_PLAN §8) ------------------------------------
+// Every control (MQTT set / web / serial) ENQUEUES a light; the pacer in
+// MeshController::loop() is the sole air-time owner. T_TX_MS = minimum gap
+// between broadcasts; CMD_REPEAT = how many times one command goes on the air.
+#define CMD_QUEUE_SIZE   64
+#define T_TX_MS          150
+#define CMD_REPEAT       2
+
+// --- MQTT reconnect backoff (Phase 3) -------------------------------------------
+// esp-mqtt retries a failed connect every network.reconnect_timeout_ms (10 s)
+// forever. After MQTT_FAST_RETRIES consecutive failures the bridge stops the
+// client (log quiets) and restarts it from HaBridge::loop() after the cooldown.
+#define MQTT_FAST_RETRIES          5
+#define MQTT_RECONNECT_COOLDOWN_MS 300000UL   // 5 min
+
 // --- WiFi / provisioning timing (bridge mode) ---------------------------------
 #define WIFI_CONNECT_TIMEOUT_MS  15000UL   // bounded STA attempt at boot
 #define PROV_TIMEOUT_MS          120000UL  // Improv window per boot, then reboot

@@ -5,8 +5,9 @@
 #include <vector>
 #include "config.h"
 
-// Phase 3 will add the HALight* handle here (home-assistant-integration);
-// keep the data model free of the library until then.
+// The HA bridge (HaBridge) publishes from this struct directly — no per-light
+// handle is stored here. The bridge builds its discovery/state JSON from
+// `id`/`name`/`number` + the believed state, so this model stays lib-free.
 struct LightDevice {
   std::string address;              // BLE MAC address (identity + logging)
   std::vector<uint8_t> mfgData;     // raw 18-byte manufacturer data (used to key)

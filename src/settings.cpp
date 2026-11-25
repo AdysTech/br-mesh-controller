@@ -3,10 +3,28 @@
 #include "settings.h"
 #include <Arduino.h>
 #include <Preferences.h>
+#include <nvs.h>
 #include "config.h"
 #include "web/WebLog.h"   // leveled logger (P2.11)
 
 static Preferences s_prefs;
+
+// The core's Preferences getters log an ESP_ERROR for a key that was never
+// written, and /api/status (pollable) runs loadSettings() — so a board whose
+// MQTT section was never saved would spam serial forever. Raw NVS calls do
+// not log; write the four optional keys empty, once.
+void seedSettings() {
+  nvs_handle_t h;
+  if (nvs_open("brmesh", NVS_READWRITE, &h) != ESP_OK) return;
+  char tmp[16];
+  for (const char* k : {"muser", "mpass", "mclient", "mname"}) {
+    size_t len = sizeof(tmp);
+    if (nvs_get_str(h, k, tmp, &len) != ESP_OK)
+      nvs_set_str(h, k, "");
+  }
+  nvs_commit(h);
+  nvs_close(h);
+}
 
 Settings loadSettings() {
   Settings s;
@@ -24,6 +42,11 @@ Settings loadSettings() {
   s.mqttPort = (uint16_t)s_prefs.getInt("mport", s.mqttPort);
   s.mqttUser = s_prefs.getString("muser", "").c_str();
   s.mqttPass = s_prefs.getString("mpass", "").c_str();
+  // MQTT client id (what the broker logs): empty = the bridge derives brmesh-<MAC tail>.
+  s.mqttClient = s_prefs.getString("mclient", "").c_str();
+  // HA hub name (dev.name): empty = the bridge falls back to the device `name`.
+  // (dev.cu is always runtime-derived as http://<board IP>/ — not stored.)
+  s.mqttName = s_prefs.getString("mname", "").c_str();
   s_prefs.end();
   return s;
 }
@@ -39,6 +62,8 @@ void saveSettings(const Settings &s) {
   s_prefs.putInt("mport", s.mqttPort);
   s_prefs.putString("muser", s.mqttUser.c_str());
   s_prefs.putString("mpass", s.mqttPass.c_str());
+  s_prefs.putString("mclient", s.mqttClient.c_str());
+  s_prefs.putString("mname", s.mqttName.c_str());
   s_prefs.end();
   LOGF("Saved settings to NVS");
 }

@@ -166,27 +166,33 @@ void MeshController::applyLight(const LightDevice& l)
   singleControl(my_key, d);
 }
 
-void MeshController::state(uint8_t n, bool on)
+// Each method stamps the believed state, then ENQUEUES the light. The pacer in
+// loop() (drainCommandQueue) owns the air-time: one unified applyLight() frame
+// per queued slot, repeated CMD_REPEAT times, T_TX_MS apart. While a scan runs,
+// enqueue() rejects — the queue and the scan are mutually exclusive (§8.2).
+bool MeshController::state(uint8_t n, bool on)
 {
   if (LightDevice *l = findLightByNumber(n))
   {
     l->on = on;
     stateDirty_ = true;
-    applyLight(*l);
+    return enqueue(n);
   }
+  return false;
 }
 
-void MeshController::brightness(uint8_t n, uint8_t b)
+bool MeshController::brightness(uint8_t n, uint8_t b)
 {
   if (LightDevice *l = findLightByNumber(n))
   {
     l->brightness = b & 127;
     stateDirty_ = true;
-    applyLight(*l);
+    return enqueue(n);
   }
+  return false;
 }
 
-void MeshController::colorTemp(uint8_t n, uint16_t t)
+bool MeshController::colorTemp(uint8_t n, uint16_t t)
 {
   if (LightDevice *l = findLightByNumber(n))
   {
@@ -194,11 +200,12 @@ void MeshController::colorTemp(uint8_t n, uint16_t t)
     l->colorMode = 2;
     l->on = true;          // a CT frame implies on
     stateDirty_ = true;
-    applyLight(*l);
+    return enqueue(n);
   }
+  return false;
 }
 
-void MeshController::rgb(uint8_t n, uint8_t r, uint8_t g, uint8_t b)
+bool MeshController::rgb(uint8_t n, uint8_t r, uint8_t g, uint8_t b)
 {
   if (LightDevice *l = findLightByNumber(n))
   {
@@ -208,7 +215,100 @@ void MeshController::rgb(uint8_t n, uint8_t r, uint8_t g, uint8_t b)
     l->colorMode = 1;
     l->on = true;          // an RGB frame implies on
     stateDirty_ = true;
-    applyLight(*l);
+    return enqueue(n);
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+//  Command queue (P3.9 / BRIDGE_PLAN §8) — enqueue + pacer.
+//
+//  enqueue() is callable from any context (MQTT task, web httpd task, serial).
+//  Latest-wins per light: re-enqueueing an already-pending light moves it to
+//  the tail (one pending slot per light, no duplication). A full queue drops
+//  the OLDEST entry and counts the overflow. drainCommandQueue() runs only
+//  from loop(): it is the sole air-time owner alongside retransmitTick.
+// ---------------------------------------------------------------------------
+bool MeshController::enqueue(uint8_t number)
+{
+  // A light that is not registered: nothing to transmit for (drivers 400/404 first).
+  if (!findLightByNumber(number))
+    return false;
+  if (!started_ || isScanning_)
+  {
+    LOGF("enqueue: rejected (scanning=%d, started=%d)", (int)isScanning_, (int)started_);
+    return false;
+  }
+  SemaphoreHandle_t mux = cmdMux_ ? cmdMux_ : xSemaphoreCreateMutex();
+  if (!mux)
+    return false;
+  BaseType_t h = xSemaphoreTake(mux, portMAX_DELAY);
+  if (h != pdTRUE)
+    return false;
+  bool ok = true;
+  // Latest-wins: drop an existing slot for this light (shift the tail).
+  for (int i = 0; i < cmdCount_; i++)
+  {
+    int idx = (cmdHead_ + i) % CMD_QUEUE_SIZE;
+    if (cmdQueue_[idx] == number)
+    {
+      for (int j = i; j < cmdCount_ - 1; j++)
+        cmdQueue_[(cmdHead_ + j) % CMD_QUEUE_SIZE] = cmdQueue_[(cmdHead_ + j + 1) % CMD_QUEUE_SIZE];
+      cmdCount_--;
+      break;
+    }
+  }
+  if (cmdCount_ == CMD_QUEUE_SIZE)
+  {
+    // Full: drop the OLDEST, keep the newest — and count it.
+    cmdHead_ = (cmdHead_ + 1) % CMD_QUEUE_SIZE;
+    cmdCount_--;
+    queueOverflowCount_++;
+  }
+  cmdQueue_[(cmdHead_ + cmdCount_) % CMD_QUEUE_SIZE] = number;
+  cmdCount_++;
+  xSemaphoreGive(mux);
+  (void)h;
+  return ok;
+}
+
+int MeshController::queueDepth() const
+{
+  // loop-context readers (the web status JSON) don't take the mutex — cmdCount_
+  // is a plain int, so a torn read at most misses a ±1 edge; acceptable here.
+  return cmdCount_;
+}
+
+unsigned long MeshController::queueOverflow() const
+{
+  return queueOverflowCount_;
+}
+
+void MeshController::sendOneQueuedLight()
+{
+  if (cmdCount_ == 0)
+    return;
+  int idx = cmdHead_ % CMD_QUEUE_SIZE;
+  uint8_t number = cmdQueue_[idx];
+  if (LightDevice *l = findLightByNumber(number))
+  {
+    for (int r = 0; r < CMD_REPEAT; r++)
+      applyLight(*l);
+  }
+  cmdHead_ = (cmdHead_ + 1) % CMD_QUEUE_SIZE;
+  cmdCount_--;
+}
+
+void MeshController::drainCommandQueue()
+{
+  if (!started_ || isScanning_)
+    return;
+  while (cmdCount_ > 0 && (uint32_t)(millis() - lastQueueSlotMs_) >= T_TX_MS)
+  {
+    sendOneQueuedLight();
+    lastQueueSlotMs_ = millis();
+    // Yield to other tasks between air slots (we're on the loop task).
+    vTaskDelay(1);
   }
 }
 
@@ -558,6 +658,7 @@ void MeshController::loop()
   }
   saveStateIfDirty(); // FR-05: persist believed state (debounced; no-op when clean)
   retransmitTick();   // P2.9: re-assert last known state on a cadence
+  drainCommandQueue(); // P3.9: sole air-time owner — send pending controls, T_TX_MS apart
 }
 
 // End a running (background) raw scan on demand. Only meaningful while a scan is
@@ -727,6 +828,23 @@ void MeshController::loadLights()
   LOGF("Restored %d lights from NVS", n);
 }
 
+void MeshController::restoreKey(const uint8_t key[4]) {
+  memcpy(my_key, key, 4);
+  prefs.begin("brmesh", false);   // read/WRITE (readOnly=false) or putBytes no-ops
+  prefs.putBytes("key", my_key, 4);
+  prefs.end();
+  LOGF("restored mesh key from backup");
+}
+
+void MeshController::restoreLights(const std::vector<LightDevice> &lights) {
+  myLights.clear();
+  for (const auto &src : lights)
+    if (src.isRegistered)
+      myLights.push_back(src);
+  saveLights();   // canonical NVS format; the caller reboots so loadLights() re-applies
+  LOGF("restored %d light(s) from backup", (int)myLights.size());
+}
+
 // ============================================================================
 //  Believed state (FR-05) + convergence re-transmit (FR-16 / P2.9)
 // ============================================================================
@@ -746,9 +864,10 @@ void MeshController::saveStateIfDirty()
 
 // Re-assert every registered light's last known state so a bulb that missed a
 // command (it was unpowered when we sent it) converges to what the user set.
-// One unified applyLight() frame per light — the exact same frame a user change
-// sends, so a re-transmit and a control are indistinguishable on the air.
-// Skipped while scanning (the radio is time-sliced) and when disabled (0).
+// ENQUEUES every light — the pacer sends the exact same unified applyLight()
+// frame a user change sends, so a re-transmit and a control are indistinguishable
+// on the air (§8: the queue is the one path to the air). Skipped while scanning
+// (the radio is time-sliced) and when disabled (0).
 void MeshController::retransmitTick()
 {
   if (retransmitIntervalMs_ == 0)
@@ -760,16 +879,16 @@ void MeshController::retransmitTick()
     return;
   lastRetransmitMs_ = now;
 
-  int sent = 0;
+  int queued = 0;
   for (auto &l : myLights)
   {
     if (!l.isRegistered)
       continue;
-    applyLight(l);
-    sent++;
+    if (enqueue(l.number))
+      queued++;
   }
-  if (sent)
-    LOGD("converge: re-asserted %d light(s)", sent);
+  if (queued)
+    LOGD("converge: re-asserted %d light(s)", queued);
   stateDirty_ = false; // the re-transmit re-sent, not changed, the state — don't re-save
 }
 
@@ -784,6 +903,8 @@ bool MeshController::rename(uint8_t number, const std::string &name)
       LOGF("renaming #%d '%s' -> '%s'", number, l.name.c_str(), name.c_str());
       l.name = name;
       saveLights();
+      if (onRenamed_)
+        onRenamed_(number); // bridge: re-publish discovery config with the new dev.name
       return true;
     }
   }
@@ -802,7 +923,10 @@ void MeshController::forget(const std::string &arg)
     if (match)
     {
       LOGF("forgetting #%d %s [%s]", it->number, it->name.c_str(), it->id.c_str());
+      uint8_t forgottenNumber = it->number;
       myLights.erase(it);
+      if (onForgotten_)
+        onForgotten_(forgottenNumber); // bridge: purge the bulb's discovery (empty retained)
       found = true;
       break;
     }
@@ -844,6 +968,10 @@ void MeshController::begin()
   NimBLEDevice::init("BRMesh Controller");
   pAdvertising = NimBLEDevice::getAdvertising();
   pAdvertising->start();
+  // Command-queue mutex (P3.9). Created here so enqueue() never has to; the
+  // lazy fallback in enqueue() covers a driver that enqueues pre-begin.
+  if (!cmdMux_)
+    cmdMux_ = xSemaphoreCreateMutex();
   loadKeyOrGenerate();
   started_ = true;
 }

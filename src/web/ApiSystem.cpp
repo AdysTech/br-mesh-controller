@@ -7,13 +7,16 @@
 #include <Preferences.h>
 #include <ctype.h>
 #include <cstring>
+#include <cstdlib>
 
 #include "MeshController.h"
+#include "HaBridge.h"
 #include "settings.h"
 #include "WebLog.h"   // leveled logger (P2.11)
 #include "ApiHttp.h"
 
 extern MeshController g_mesh;
+extern HaBridge g_bridge;   // app shell (main.cpp) — ctrl_id + live identity update
 
 void requestProvisioning();   // app shell (main.cpp) — clears WiFi creds + reboots
 void setDeviceName(const char* name);   // app shell (main.cpp)
@@ -24,7 +27,7 @@ void setDeviceName(const char* name);   // app shell (main.cpp)
 // ----------------------------------------------------------------------------
 static esp_err_t apiConfigGetHandler(httpd_req_t *req) {
   const Settings s = loadSettings();
-  char buf[512];
+  char buf[768];
   int n = snprintf(buf, sizeof(buf),
       "{\"name\":\"%s\","
       "\"ssid\":\"%s\","
@@ -32,14 +35,22 @@ static esp_err_t apiConfigGetHandler(httpd_req_t *req) {
       "\"mhost\":\"%s\","
       "\"mport\":%u,"
       "\"muser\":\"%s\","
-      "\"mpass\":\"%s\"}",
+      "\"mpass\":\"%s\","
+      "\"mclient\":\"%s\","
+      "\"mqtt_client\":\"%s\","
+      "\"mname\":\"%s\","
+      "\"ctrl_id\":\"%s\"}",
       jsonEscape(s.name.c_str()).c_str(),
       jsonEscape(s.ssid.c_str()).c_str(),
       s.pass.empty() ? "" : "****",
       jsonEscape(s.mqttHost.c_str()).c_str(),
       (unsigned)s.mqttPort,
       jsonEscape(s.mqttUser.c_str()).c_str(),
-      s.mqttPass.empty() ? "" : "****");
+      s.mqttPass.empty() ? "" : "****",
+      jsonEscape(s.mqttClient.c_str()).c_str(),
+      jsonEscape(g_bridge.clientId().c_str()).c_str(),
+      jsonEscape(s.mqttName.c_str()).c_str(),
+      g_bridge.ctrlId().empty() ? "" : g_bridge.ctrlId().c_str());
   if (n <= 0) { apiSendError(req, 500, "config build failed"); return ESP_FAIL; }
   apiSendJson(req, 200, buf);
   return ESP_OK;
@@ -63,6 +74,7 @@ static esp_err_t apiConfigPostHandler(httpd_req_t *req) {
   String body = apiReadBody(req, 1024);
   Settings s = loadSettings();
   bool wifiTouched = false;
+  bool mqttTouched = false;
 
   {
     std::string v = apiJsonString(body, "name");
@@ -76,7 +88,9 @@ static esp_err_t apiConfigPostHandler(httpd_req_t *req) {
   // UNCHANGED. A real "" clears the field (open network, no broker auth).
   {
     std::string v = apiJsonString(body, "ssid");
-    if (!v.empty()) { s.ssid = v; wifiTouched = true; }
+    // The SPA round-trips the whole cfg on every save, so the current ssid
+    // echoes back even on a pure MQTT save — flag a reboot only when it CHANGED.
+    if (!v.empty() && v != s.ssid) { s.ssid = v; wifiTouched = true; }
   }
   {
     std::string v = apiJsonString(body, "pass");
@@ -84,29 +98,51 @@ static esp_err_t apiConfigPostHandler(httpd_req_t *req) {
   }
   {
     std::string v = apiJsonString(body, "mhost");
-    if (!v.empty()) s.mqttHost = v;
+    if (!v.empty()) { s.mqttHost = v; mqttTouched = true; }
   }
   {
     int p = apiJsonInt(body, "mport");
-    if (p >= 1 && p <= 65535) s.mqttPort = (uint16_t)p;
+    if (p >= 1 && p <= 65535) { s.mqttPort = (uint16_t)p; mqttTouched = true; }
   }
   {
     std::string v = apiJsonString(body, "muser");
-    if (v != "****") s.mqttUser = v;
+    if (v != "****") { s.mqttUser = v; mqttTouched = true; }
   }
   {
     std::string v = apiJsonString(body, "mpass");
-    if (v != "****") s.mqttPass = v;
+    if (v != "****") { s.mqttPass = v; mqttTouched = true; }
+  }
+  // mclient: the MQTT client id (broker-side name). Presence in the body is what
+  // matters so the UI can clear it (send "") back to the derived default.
+  {
+    if (body.indexOf("\"mclient\"") != (unsigned)-1) {
+      s.mqttClient = apiJsonString(body, "mclient");
+      mqttTouched = true;
+    }
+  }
+  // mname: empty = the bridge falls back to the device `name` as dev.name.
+  // Presence in the body is what matters, so the UI can clear it by sending "".
+  // (dev.cu is never stored — always http://<board IP>/ at publish time.)
+  {
+    if (body.indexOf("\"mname\"") != (unsigned)-1) {
+      s.mqttName = apiJsonString(body, "mname");
+      mqttTouched = true;
+    }
   }
 
   saveSettings(s);
+  if (mqttTouched) g_bridge.updateSettings(s);
   if (apiJsonString(body, "name") == s.name)
     setDeviceName(s.name.c_str());   // persist + apply to the live netif
 
   char buf[160];
+  // A broker change (host/port/user/pass/client/name) also needs a reboot:
+  // esp-mqtt bakes the broker address+creds into the client at init, so it only
+  // takes effect from the next boot. Flag that too, not just a WiFi change.
+  const bool rebootNeeded = wifiTouched || mqttTouched;
   int n = snprintf(buf, sizeof(buf),
                    "{\"saved\":true,\"reboot_needed\":%s,\"name\":\"%s\"}",
-                   wifiTouched ? "true" : "false",
+                   rebootNeeded ? "true" : "false",
                    jsonEscape(s.name.c_str()).c_str());
   apiSendJson(req, 200, buf);
   return ESP_OK;
@@ -125,19 +161,197 @@ static esp_err_t apiProvisionHandler(httpd_req_t *req) {
 }
 
 // ----------------------------------------------------------------------------
-//  POST /api/factory-reset — wipe the whole brmesh NVS namespace (mesh key +
-//  light list) and reboot; every bulb returns to factory key and must be
-//  re-keyed. WiFi creds are KEPT (the board stays reachable).
+//  POST /api/factory-reset — wipe the mesh key + light list and reboot; every
+//  bulb returns to factory key and must be re-keyed. Device settings (name,
+//  WiFi creds, MQTT) are KEPT so the board stays reachable.
+//  The mesh data and the settings share the 'brmesh' NVS namespace, so wipe
+//  the whole thing and re-write just the settings keys — leaving only the
+//  mesh data removed (do NOT let this drop the WiFi creds: see the bug this
+//  fix closes).
 // ----------------------------------------------------------------------------
 static esp_err_t apiFactoryResetHandler(httpd_req_t *req) {
   apiSendJson(req, 200, "{\"resetting\":true}");
   vTaskDelay(pdMS_TO_TICKS(150));
 
-  LOGF("factory-reset: wiping NVS 'brmesh' (mesh key + light list), rebooting");
+  const Settings kept = loadSettings();   // capture creds + name + MQTT first
   Preferences p;
   p.begin("brmesh", false);
-  p.clear();
+  p.clear();                              // wipes mesh key + light list + settings
   p.end();
+  saveSettings(kept);                     // re-write ONLY the settings keys
+  LOGF("factory-reset: wiped mesh key + light list, kept device settings, rebooting");
+  delay(100);
+  ESP.restart();
+  return ESP_OK;
+}
+
+// ----------------------------------------------------------------------------
+//  Backup / restore — a portable snapshot of the whole device state: settings
+//  (name + WiFi + MQTT), the RAW 4-byte mesh key, and every registered light
+//  (number, HA id, name, MAC, type, believed state). The format is flat
+//  (prefix-keyed) so the board's tiny apiJson* readers can parse it with no
+//  JSON lib — see the schema comment on apiBackupHandler. The mesh key rides
+//  in the clear here on purpose: it is broadcast over BLE to the bulbs, so a
+//  backup file is no more secret than the air itself (BRIDGE_PLAN §6).
+//
+//  GET  /api/backup  -> the JSON snapshot (download)
+//  POST /api/restore  <- that JSON; overwrites settings + key + lights, reboots
+// ----------------------------------------------------------------------------
+// Append one flat "prefixsuffix":"value" entry (string) into a heap-backed
+// String — no fixed intermediate buffer, so long values (name, mac, id) are
+// never truncated. `val` is JSON-escaped.
+static void kvString(String &out, const char *prefix, const char *suffix, const char *val) {
+  out.concat(",\""); out.concat(prefix); out.concat(suffix);
+  out.concat("\":\""); out.concat(jsonEscape(val).c_str()); out.concat("\"");
+}
+static void kvInt(String &out, const char *prefix, const char *suffix, int val) {
+  out.concat(",\""); out.concat(prefix); out.concat(suffix);
+  out.concat("\":"); out.concat(val);
+}
+
+// Serialize one light's fields as flat "l<N>_<field>" entries into `out`.
+static void appendLightJson(String &out, int i, const LightDevice &l) {
+  char key[8];
+  snprintf(key, sizeof(key), "l%d_", i);
+
+  kvInt(out, key, "num", l.number);
+  kvString(out, key, "id", l.id.c_str());
+  kvString(out, key, "nm", l.name.c_str());
+  kvString(out, key, "mac", l.address.c_str());
+  char type[8];
+  snprintf(type, sizeof(type), "%02x%02x", l.type[0], l.type[1]);
+  kvString(out, key, "type", type);
+  kvInt(out, key, "on", l.on ? 1 : 0);
+  kvInt(out, key, "bri", l.brightness);
+  kvInt(out, key, "r", l.rgbR);
+  kvInt(out, key, "g", l.rgbG);
+  kvInt(out, key, "b", l.rgbB);
+  kvInt(out, key, "ct", l.ct);
+  kvInt(out, key, "cm", l.colorMode);
+}
+
+// ----------------------------------------------------------------------------
+//  GET /api/backup — the flat snapshot. Schema (all top-level keys quoted, so
+//  the restore-side apiJson* readers find them unambiguously):
+//    v:1  fw  board  key:<8 hex>  ln:<n>
+//    s_name s_ssid s_pass s_mhost s_mport s_muser s_mpass s_mclient s_mname
+//    per light i: l<i>_num l<i>_id l<i>_nm l<i>_mac l<i>_type l<i>_on
+//                 l<i>_bri l<i>_r l<i>_g l<i>_b l<i>_ct l<i>_cm
+// ----------------------------------------------------------------------------
+static esp_err_t apiBackupHandler(httpd_req_t *req) {
+  if (!g_mesh.started()) { apiSendError(req, 503, "engine offline (provisioning mode)"); return ESP_FAIL; }
+  const Settings s = loadSettings();
+  const uint8_t *k = g_mesh.key();
+  const std::vector<LightDevice> &lights = g_mesh.lights();
+
+  String out;
+  out.concat("{\"v\":1");   // kv*() below each prepend their own leading comma
+  kvString(out, "", "fw", FIRMWARE_VERSION);
+  kvString(out, "", "board", kBoardModel);
+  char keyHex[16];
+  snprintf(keyHex, sizeof(keyHex), "%02x%02x%02x%02x", k[0], k[1], k[2], k[3]);
+  kvString(out, "", "key", keyHex);
+  kvInt(out, "", "ln", (int)lights.size());
+
+  // settings (empty values serialize as "" — a restore of a fresh board's
+  // backup is a no-op for any unset field).
+  kvString(out, "s_", "name", s.name.c_str());
+  kvString(out, "s_", "ssid", s.ssid.c_str());
+  kvString(out, "s_", "pass", s.pass.c_str());
+  kvString(out, "s_", "mhost", s.mqttHost.c_str());
+  kvInt(out, "s_", "mport", (int)s.mqttPort);
+  kvString(out, "s_", "muser", s.mqttUser.c_str());
+  kvString(out, "s_", "mpass", s.mqttPass.c_str());
+  kvString(out, "s_", "mclient", s.mqttClient.c_str());
+  kvString(out, "s_", "mname", s.mqttName.c_str());
+
+  for (int i = 0; i < (int)lights.size(); i++)
+    appendLightJson(out, i, lights[i]);
+  out.concat("}");
+
+  apiSendJson(req, 200, out.c_str());
+  return ESP_OK;
+}
+
+// Validate an 8-char hex string into a 4-byte key. Returns false on any bad
+// length / non-hex / out-of-range byte.
+static bool parseBackupKey(const std::string &hex, uint8_t key[4]) {
+  if (hex.size() != 8) return false;
+  for (int i = 0; i < 4; i++) {
+    const std::string byte = hex.substr(i * 2, 2);
+    char *end = nullptr;
+    unsigned long v = strtoul(byte.c_str(), &end, 16);
+    if (end != byte.c_str() + 2 || v > 0xFF) return false;
+    key[i] = (uint8_t)v;
+  }
+  return true;
+}
+
+// ----------------------------------------------------------------------------
+//  POST /api/restore — apply a backup (settings + key + lights), then reboot so
+//  begin() re-keys nothing and loadLights() re-fires onRegistered (HA re-
+//  publish). The response goes out BEFORE the write + reboot (same contract as
+//  factory-reset). Note: if the backup's WiFi differs, the board comes back on
+//  that network, not this one.
+// ----------------------------------------------------------------------------
+static esp_err_t apiRestoreHandler(httpd_req_t *req) {
+  if (!g_mesh.started()) { apiSendError(req, 503, "engine offline (provisioning mode)"); return ESP_FAIL; }
+
+  String body = apiReadBody(req, 32768);
+
+  uint8_t key[4];
+  if (!parseBackupKey(apiJsonString(body, "key"), key)) {
+    apiSendError(req, 400, "backup malformed: 'key' must be 8 hex chars");
+    return ESP_FAIL;
+  }
+  int ln = apiJsonInt(body, "ln");
+  if (ln < 0) ln = 0;
+  if (ln > 64) { apiSendError(req, 400, "backup malformed: too many lights (max 64)"); return ESP_FAIL; }
+
+  Settings s;
+  s.name       = apiJsonString(body, "s_name");
+  s.ssid       = apiJsonString(body, "s_ssid");
+  s.pass       = apiJsonString(body, "s_pass");
+  s.mqttHost   = apiJsonString(body, "s_mhost");
+  s.mqttPort   = (uint16_t)apiJsonInt(body, "s_mport");
+  if (s.mqttPort < 1) s.mqttPort = 1883;
+  s.mqttUser   = apiJsonString(body, "s_muser");
+  s.mqttPass   = apiJsonString(body, "s_mpass");
+  s.mqttClient = apiJsonString(body, "s_mclient");
+  s.mqttName   = apiJsonString(body, "s_mname");
+
+  std::vector<LightDevice> lights;
+  lights.reserve(ln);
+  for (int i = 0; i < ln; i++) {
+    char key[8];
+    snprintf(key, sizeof(key), "l%d_", i);
+    LightDevice l;
+    l.number     = (uint8_t)apiJsonInt(body, (String(key) + "num").c_str());
+    l.id         = apiJsonString(body, (String(key) + "id").c_str());
+    l.name       = apiJsonString(body, (String(key) + "nm").c_str());
+    l.address    = apiJsonString(body, (String(key) + "mac").c_str());
+    std::string t = apiJsonString(body, (String(key) + "type").c_str());
+    if (t.size() >= 4) {
+      l.type[0] = (uint8_t)strtoul(t.substr(0, 2).c_str(), nullptr, 16);
+      l.type[1] = (uint8_t)strtoul(t.substr(2, 2).c_str(), nullptr, 16);
+    }
+    l.on         = apiJsonInt(body, (String(key) + "on").c_str()) != 0;
+    l.brightness = (uint8_t)apiJsonInt(body, (String(key) + "bri").c_str());
+    l.rgbR       = (uint8_t)apiJsonInt(body, (String(key) + "r").c_str());
+    l.rgbG       = (uint8_t)apiJsonInt(body, (String(key) + "g").c_str());
+    l.rgbB       = (uint8_t)apiJsonInt(body, (String(key) + "b").c_str());
+    l.ct         = (uint16_t)apiJsonInt(body, (String(key) + "ct").c_str());
+    l.colorMode  = (uint8_t)apiJsonInt(body, (String(key) + "cm").c_str());
+    l.isRegistered = true;
+    lights.push_back(l);
+  }
+
+  apiSendJson(req, 200, (String("{\"restored\":true,\"lights\":") + ln + "}").c_str());
+  vTaskDelay(pdMS_TO_TICKS(150));   // let the response flush
+  saveSettings(s);
+  g_mesh.restoreKey(key);
+  g_mesh.restoreLights(lights);
+  LOGF("restore: applied settings + key + %d light(s), rebooting", ln);
   delay(100);
   ESP.restart();
   return ESP_OK;
@@ -195,9 +409,17 @@ bool registerSystemRoutes(httpd_handle_t srv) {
   if (httpd_register_uri_handler(srv, &u) != ESP_OK) return false;
 
   memset(&u, 0, sizeof(u));
+  u.uri = "/api/backup"; u.method = HTTP_GET; u.handler = apiBackupHandler;
+  if (httpd_register_uri_handler(srv, &u) != ESP_OK) return false;
+
+  memset(&u, 0, sizeof(u));
+  u.uri = "/api/restore"; u.method = HTTP_POST; u.handler = apiRestoreHandler;
+  if (httpd_register_uri_handler(srv, &u) != ESP_OK) return false;
+
+  memset(&u, 0, sizeof(u));
   u.uri = "/api/raw"; u.method = HTTP_POST; u.handler = apiRawPostHandler;
   if (httpd_register_uri_handler(srv, &u) != ESP_OK) return false;
 
-  LOGD("web: + /api/config, /api/provision, /api/factory-reset, /api/raw");
+  LOGD("web: + /api/config, /api/provision, /api/factory-reset, /api/backup, /api/restore, /api/raw");
   return true;
 }

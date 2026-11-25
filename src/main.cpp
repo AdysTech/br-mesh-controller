@@ -10,8 +10,8 @@
 //    * console.{h,cpp}   — the serial console driver
 //
 //  BRIDGE_PLAN §5 boot flow: NVS creds -> bounded STA attempt -> Improv BLE
-//  provisioning fallback. Web (Phase 1) + MQTT/HA (Phase 3) front ends land
-//  here later.
+//  provisioning fallback. Front ends wired here: serial console, web shell
+//  (Phase 1), HA/MQTT bridge (Phase 3, HaBridge).
 //
 //  Provisioning rule: on a provisioning boot the mesh engine is NEVER started
 //  — Improv owns the BLE radio for that boot, and provisioning always ends in
@@ -27,6 +27,7 @@
 
 #include "config.h"
 #include "MeshController.h"
+#include "HaBridge.h"
 #include "console.h"
 #include "settings.h"
 #include "statusled.h"
@@ -39,6 +40,7 @@
 MeshController g_mesh;
 Console g_console(g_mesh);
 ImprovWiFiBLE g_improv;
+HaBridge g_bridge(g_mesh);     // Phase 3 — console/API reference it via extern
 
 static bool     s_provisioning = false;
 static uint32_t s_provStarted  = 0;
@@ -126,6 +128,11 @@ void setup() {
   ledInit();
   ledSet(LED_BOOT);
 
+  // Ensure the optional Phase-3 NVS keys exist (empty) before the first
+  // loadSettings() — Preferences logs an ESP_ERROR per missing key, and
+  // /api/status is polled (see seedSettings in settings.cpp).
+  seedSettings();
+
   // ---- BRIDGE_PLAN §5 boot flow: NVS creds -> bounded STA -> Improv -------
   // The mesh engine is deliberately NOT started on a provisioning boot (see
   // the file header): Improv owns the BLE radio for that boot.
@@ -179,8 +186,17 @@ void setup() {
   if (!webServerInit())
     LOGF("web: HTTP server failed to start — console-only mode");
 
-  // 3) Restore already-registered lights (no re-keying).
-  g_mesh.loadLights();
+  // 3) HA bridge (Phase 3): wire the driver hooks, restore the light list, THEN
+  //    start MQTT. loadLights() fires onRegistered per light, but bulbRegistered
+  //    is a no-op until begin() sets enabled_ — so nothing publishes early. The
+  //    FIRST publishAll() on MQTT connect then sees the full restored list and
+  //    publishes the hub state (real light count) + every bulb in one pass.
+  //    Restoring BEFORE begin() is what fixes the first-boot "Lights: 0".
+  g_mesh.setOnRegistered([](LightDevice& l) { g_bridge.bulbRegistered(l); });
+  g_mesh.setOnRenamed([](uint8_t n) { g_bridge.bulbRenamed(n); });
+  g_mesh.setOnForgotten([](uint8_t n) { g_bridge.bulbForgotten(n); });
+  g_mesh.loadLights();                 // restore NVS lights (no publish yet)
+  g_bridge.begin(s);                   // MQTT connect -> publishAll (full list + count)
 
   LOGF("Ready. Web: http://%s.local  —  serial console: 'help'.", s.name.c_str());
   LOGF("To key the bulb, power-cycle it, then type 'scan 12'.");
@@ -234,6 +250,9 @@ void loop() {
 
   // Engine: run any queued background scan (console 'scan').
   g_mesh.loop();
+
+  // HA bridge: refresh the retained hub-state JSON (~30 s cadence).
+  g_bridge.loop();
 
   // Serial console.
   g_console.poll();

@@ -29,7 +29,7 @@ String apiReadBody(httpd_req_t *req, size_t cap) {
   for (;;) {
     int r = httpd_req_recv(req, buf, sizeof(buf));
     if (r <= 0) break;              // 0 = end of body / error
-    body += buf;
+    body.concat(buf, r);            // recv does NOT null-terminate: append exactly r bytes
     if (body.length() >= cap) break;
   }
   if (body.length() > cap) body = body.substring(0, cap);
@@ -82,7 +82,10 @@ std::string apiJsonString(const String &body, const char *key) {
   if (q == -1) return "";
   size_t e = body.indexOf('"', q + 1);
   if (e == -1) return body.substring(q + 1).c_str(); // unterminated string — take the rest
-  return body.substring(q + 1, e - (q + 1)).c_str();
+  // substring(a, b) copies b-a bytes from a — the 2nd arg is an END index, not a
+  // length (and it swaps the pair if a > b, which silently re-sliced the WRONG
+  // region of the body). Use the end index e directly.
+  return body.substring(q + 1, e).c_str();
 }
 
 bool apiJsonBool(const String &body, const char *key) {

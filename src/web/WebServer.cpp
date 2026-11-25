@@ -17,6 +17,7 @@
 #include <WiFi.h>
 #include <LittleFS.h>
 #include <esp_http_server.h>
+#include <esp_heap_caps.h>   // min-seen heap + largest free internal block
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <cstring>
@@ -25,12 +26,14 @@
 #include "config.h"
 #include "settings.h"
 #include "MeshController.h"
+#include "HaBridge.h"
 #include "ApiHttp.h"
 #include "ApiLights.h"
 #include "ApiSystem.h"
 #include "WebLog.h"
 
 extern MeshController g_mesh;   // app shell (main.cpp)
+extern HaBridge g_bridge;       // app shell (main.cpp)
 
 httpd_handle_t g_webServer = nullptr;
 
@@ -184,33 +187,52 @@ static esp_err_t wsLogHandler(httpd_req_t *req) {
 // ----------------------------------------------------------------------------
 static esp_err_t apiStatusHandler(httpd_req_t *req) {
   const Settings s = loadSettings();
-  char buf[512];
+  char buf[768];
   int n = snprintf(buf, sizeof(buf),
       "{\"name\":\"%s\","
       "\"mode\":\"sta\","
       "\"ip\":\"%s\","
       "\"ssid\":\"%s\","
       "\"rssi\":%d,"
-      "\"mqtt\":false,"
+      "\"mqtt\":%s,"
+      "\"mqtt_enabled\":%s,"
+      "\"ctrl_id\":\"%s\","
       "\"lights\":%d,"
       "\"scanning\":%s,"
+      "\"queue_depth\":%d,"
+      "\"queue_overflow\":%lu,"
       "\"fw\":\"%s\","
       "\"spa\":\"%s\","
       "\"board\":\"%s\","
       "\"uptime_s\":%lu,"
-      "\"heap_free\":%lu}",
+      "\"heap_free\":%lu,"
+      "\"free_heap_kb\":%lu,"
+      "\"min_free_heap_kb\":%lu,"
+      "\"largest_free_internal_block_kb\":%lu,"
+      "\"psram_size_kb\":%lu,"
+      "\"psram_free_kb\":%lu}",
       jsonEscape(s.name.c_str()).c_str(),
       WiFi.localIP().toString().c_str(),
       jsonEscape(s.ssid.c_str()).c_str(),
       (int)WiFi.RSSI(),
+      g_bridge.connected() ? "true" : "false",
+      g_bridge.enabled() ? "true" : "false",
+      g_bridge.ctrlId().empty() ? "" : g_bridge.ctrlId().c_str(),
       g_mesh.lightCount(),
       g_mesh.isScanning() ? "true" : "false",
+      g_mesh.queueDepth(),
+      (unsigned long)g_mesh.queueOverflow(),
       FIRMWARE_VERSION,
       jsonEscape(webSpaVersion()).c_str(),
       kBoardModel,
       (unsigned long)(millis() / 1000),
-      (unsigned long)ESP.getFreeHeap());
-  if (n <= 0) { apiSendError(req, 500, "status build failed"); return ESP_FAIL; }
+      (unsigned long)ESP.getFreeHeap(),
+      (unsigned long)(esp_get_free_heap_size() / 1024),
+      (unsigned long)(esp_get_minimum_free_heap_size() / 1024),
+      (unsigned long)((uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024),
+      (unsigned long)(ESP.getPsramSize() / 1024),
+      (unsigned long)(ESP.getFreePsram() / 1024));
+  if (n < 0 || (size_t)n >= sizeof(buf)) { apiSendError(req, 500, "status build failed"); return ESP_FAIL; }
   apiSendJson(req, 200, buf);
   return ESP_OK;
 }
