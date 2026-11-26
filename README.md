@@ -20,7 +20,9 @@ The controller is the **key originator**: it **generates its own 4-byte key** an
 Implemented today (one build, one firmware):
 - **WiFi** — STA mode with **Improv BLE** provisioning (boots into provisioning when unprovisioned or when the link keeps failing).
 - **Web shell** — a REST API (`/api/*`), a live log WebSocket (`/ws/log`), and a **Svelte SPA** (Lights · Config · Console · Info) served from LittleFS.
-- **Home Assistant bridge** — standard MQTT **device-based discovery**: one hub device (diagnostics + a "Start scan" button) and one **light entity per bulb** (on/off, brightness, RGB, colour-temp), all as retained QoS1 JSON over the esp-mqtt client.
+- **Home Assistant bridge** — standard MQTT **device-based discovery**: one hub device (diagnostics + a "Start scan" button) and one **light entity per bulb** (on/off, brightness, RGB, colour-temp), all as retained QoS1 JSON over the esp-mqtt client. 
+<img width="1261" height="781" alt="image" src="https://github.com/user-attachments/assets/1a3b812e-5a59-4fa7-b8bb-3b56f0ada8bd" />
+
 - **Serial console** (115200) — discovery, per-light control, config, provisioning, and raw-capture debugging.
 - **Portable backup / restore** — the board's full state (settings + mesh key + light list) as a JSON snapshot.
 
