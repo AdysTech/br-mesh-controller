@@ -42,7 +42,7 @@
 | FR-06 | A raw FastCon packet-capture path shall exist on serial **and** in the web console, triggerable from the UI (field path for new bulb models) | Mandatory |
 | FR-07 | Key, light list, and all config (name, WiFi, MQTT) shall persist in NVS across reboots; no re-keying on power-cycle | Mandatory |
 | FR-08 | The serial console (POC command set: `list`, `sel`, `on/off/ct/rgb`, `scan`, `raw`…) shall keep working in bridge mode | Mandatory |
-| FR-09 | Colour + white control (bulbs advertise type `2A A8`) — **the on-hand bulbs are RGBW**: one op `0x72`, one 8-byte payload, two mutually-exclusive modes — **RGB** (`d[3]=B,d[4]=R,d[5]=G`, white off) **or** **WW/CW white crossfade** (`d[6]=CW, d[7]=255−CW`, RGB off), not a single-axis CT ([protocol.md](protocol.md) §2.5b): the UI ships a colour/white control in Phase 2 (P2.10), and the firmware now encodes the correct unified `0x72` wire (RGB or CW/WW crossfade, `d[2]=0xff`) — **Finding F-CT fixed 2026-11-20**, kelvin unit adopted 2026-11-22 (Appendix C): `ct` is a kelvin label (2700–6000 K) end-to-end, split to the WW/CW crossfade only at TX. Remaining: the fine kelvin→byte mid-curve (LUT) is Phase 5 (P5.2) | Phase 2 UI (P2.10) + correct wire + kelvin unit (done); fine mid-curve LUT Phase 5 (P5.2) |
+| FR-09 | Colour + white control (bulbs advertise type `2A A8`) — **the on-hand bulbs are RGBW**: one op `0x72`, one 8-byte payload, two mutually-exclusive modes — **RGB** (`d[3]=B,d[4]=R,d[5]=G`, white off) **or** **WW/CW white crossfade** (`d[6]=CW, d[7]=255−CW`, RGB off), not a single-axis CT ([protocol.md](protocol.md) §2.5b): the UI ships a colour/white control in Phase 2 (P2.10), and the firmware now encodes the correct unified `0x72` wire (RGB or CW/WW crossfade, `d[2]=0xff`) — **Finding F-CT fixed 2026-11-20**, kelvin unit adopted 2026-11-22 (Appendix C): `ct` is a kelvin label (2700–6000 K) end-to-end, split to the WW/CW crossfade only at TX. Remaining: the fine kelvin→byte mid-curve (LUT) is Phase 5 (P4.2) | Phase 2 UI (P2.10) + correct wire + kelvin unit (done); fine mid-curve LUT Phase 5 (P4.2) |
 | FR-10 | "All lights" **virtual selection** (ESP-owned fan-out entity, every keyed bulb) — §7.3 L2 | Later (Phase 5) |
 | FR-15 | **Native room groups (§7.3 L1):** a bulb is assigned to a physical room at keying; whole-room command = one FastCon group frame. **Verify-first** on the `0x21` assign + type-3 group frames (not yet in protocol.md); until verified, a room group is a virtual selection (L2) | Later (Phase 5, gated on verification) |
 | FR-16 | **State convergence:** a bulb is broadcast-only and may have missed a command (unpowered when we sent it), so the controller shall re-transmit each light's last known state on a fixed cadence (default ~10 s, tunable) so the air converges to what the user set; off must stay off (never re-send a colour frame to an off bulb); skipped while scanning (radio is time-sliced) | Phase 2 (P2.9) |
@@ -86,7 +86,8 @@
  │              Waveshare ESP32-S3-Zero                    │
  │  • WiFi STA (Improv-provisioned creds, NVS)            │
  │  • esp_http_server (REST + /ws/log, LittleFS SPA)      │
- │  • HA lib: HALight per bulb, button, sensors           │
+ │  • MQTT bridge: hub device + one device per bulb       │
+ │    (standard device-based discovery, §7.2)             │
  │  • MeshController: FastCon engine (NimBLE adv/scan)    │
  │  • Serial console (115200) — POC command set, always   │
  └───────────────▲────────────────────────────────────────┘
@@ -115,7 +116,7 @@
 | Frontend | **Svelte + Vite**, `vite-plugin-singlefile` → one gzipped `index.html` → LittleFS | User mandate: reuse lora-relay's pipeline. `tools/build_spa.py` pre-action. |
 | Filesystem | LittleFS (`board_build.filesystem = littlefs`, 896 KB slot in [partitions.csv](partitions.csv)) | Already configured. |
 | Config | **NVS** (`Preferences`, namespace `brmesh`) — name, WiFi, MQTT | No hardcoding. [settings.\*](src/settings.cpp) landed. |
-| HA | `dawidchyrzynski/home-assistant-integration` (HADevice/HAMqtt/HALight) + hand-rolled discovery for button/sensors | Per-bulb `HALight`; controller entities hand-rolled. Currently commented out in [platformio.ini](platformio.ini). |
+| HA bridge | **Standard HA MQTT *device-based* discovery** (plain retained JSON, HA ≥ 2026.4 key set) over **`esp-mqtt`** (ESP-IDF core `esp_mqtt_client`) + one discovery/state JSON builder module — no third-party MQTT or HA library | `esp-mqtt` gives the async FreeRTOS task, QoS 0/1/2 with retransmit outbox, built-in exponential-backoff reconnect + LWT + session resume, and a configurable buffer (`buffer.size` / `outbox`) for the discovery payloads; MQTT 3.1.1 or 5.0. HA subscribes to the standard `homeassistant/device/<uid>/config` topics (§7.2): one controller-hub device + one device per bulb, linked by `via_device`, `dev.cu` → the Svelte SPA. `dawidchyrzynski/home-assistant-integration` is **not used** (it emits classic per-component discovery) — stays commented out in [platformio.ini](platformio.ini). |
 | Provisioning | **Improv BLE** (`jnthas/Improv-WiFi-Library`, NimBLE) — lora-relay's proven route | Runtime-gated: skipped when STA already connects. Fallback if it fails: captive portal (SoftAP + DNSServer → `/setup`), keeps the bulb stack untouched. |
 | Groups | **Two layers (§7.3):** native room groups (ESP NVS + bulb flash, 1-frame) **+** virtual selections (ESP- or HA-owned fan-out) | Native 1-frame path is verify-first (§7.3); virtual fan-out via the §8 queue. Phase 5. |
 | Status LED | WS2812B, GPIO 21, `Adafruit_NeoPixel` 1 px ([statusled.\*](src/statusled.cpp)) | boot=white, scanning=blue, keying=amber, wifi=green, prov=red, error=fast-red. |
@@ -143,7 +144,7 @@ lora-relay proven shape (dual OTA + A/B SPA slots; see [partitions.csv](partitio
 
 | Store | Contents | Access Pattern |
 |-------|----------|----------------|
-| **NVS** `brmesh` | name; wifi ssid/pass; mqtt host/port/user/pass; 4-byte mesh key; light list (id, **name**, mac, type, features) | Fast read/write; **write paths must open with `readOnly=false`** (proven gotcha, CLAUDE.md §2) |
+| **NVS** `brmesh` | name; wifi ssid/pass; mqtt host/port/user/pass; mqtt **hub name `mname`** (HA `dev.name`; empty → device `name`); 4-byte mesh key; light list (id, **name**, mac, type, features) | Fast read/write; **write paths must open with `readOnly=false`** (proven gotcha, CLAUDE.md §2). `dev.cu` is NOT stored — always derived at publish time as `http://<board IP>/` |
 | **LittleFS** | `index.html.gz` — single-file SPA | Served over HTTP; replaceable via UI upload |
 | **SRAM** | Believed state per light (last sent on/brightness/rgb), scan state, WS client registry, log ring | Volatile; believed state is the source of HA state |
 
@@ -169,11 +170,12 @@ lora-relay proven shape (dual OTA + A/B SPA slots; see [partitions.csv](partitio
    │                                                      ▼
    │                     esp_http_server up (SPA, REST, WS)
    │                                                      ▼
-   │                     MQTT creds in NVS? ── no ──▶ skip HA (web+serial only)
+   │                     MQTT host in NVS (mhost)? ── no ──▶ skip HA (web+serial only)
    │                        │ yes
    │                        ▼
-   │                     MQTT connect → HA entities publish
-   │                        (discovery AFTER mqtt->begin — order is load-bearing)
+   │                     MQTT connect → birth + LWT set, hub + bulb
+   │                     discovery published (AFTER the connect — order is
+   │                     load-bearing; re-published on homeassistant/status → online)
    │                                                      ▼
    │                     loadLights() → restore believed state → IDLE (green)
    │
@@ -242,16 +244,23 @@ serves the last N lines on connect so a reconnect loses nothing.
 
 ### 7.1 Entity Model
 
-| Entity | Type | Source |
-|--------|------|--------|
-| One light per keyed bulb (user-renamable, FR-13) | `HALight` (RGB + brightness first; CT in Phase 5) | home-assistant-integration lib |
-| **Room group** (physical, e.g. `living_room`) — §7.3 L1 | `HALight` (ESP-owned) | native group frame = **1 TX** once `0x21`/type-3 verified; else L2 batched fan-out |
-| **Virtual selection** (e.g. `All lights`, FR-10) — §7.3 L2 | `HALight` (ESP-owned) | fan-out through the §8 queue (Phase 5) |
-| **Virtual selection** (e.g. `TV rim`) — §7.3 L2 | HA `group`/`scene` (HA-owned) | HA fans out to member lights → §8 queue |
-| `Start scan` | HA **button** | hand-rolled discovery |
-| `Scan state` (IDLE/SCANNING/KEYING) | HA sensor | hand-rolled discovery |
-| `Lights registered` | HA sensor | hand-rolled discovery |
-| `WiFi RSSI` / `MQTT link` | HA sensors | hand-rolled discovery |
+| Entity | HA component | Lives on which device |
+|--------|-------------|-----------------------|
+| One light per keyed bulb (user-renamable, FR-13) — on/off, brightness, RGB first; CT in Phase 5 (P4.2) | `light` | **the bulb's own device** `homeassistant/device/<ctrl_id>_l<n>/config`, linked back with `via_device` (§7.2) |
+| `Start scan` | `button` | controller-hub device |
+| `Scan state` (IDLE/SCANNING/KEYING), `Lights registered`, `WiFi RSSI`, `MQTT link`, `Queue depth` (diagnostic) | `sensor` | controller-hub device |
+| **Room group** (physical, e.g. `living_room`) — §7.3 L1 | `light` (ESP-owned) | controller-hub device; native group frame = **1 TX** once `0x21`/type-3 verified; else L2 batched fan-out (Phase 5) |
+| **Virtual selection** (e.g. `All lights`, FR-10) — §7.3 L2 | `light` (ESP-owned) | controller-hub device; fan-out through the §8 queue (Phase 5) |
+| **Virtual selection** (e.g. `TV rim`) — §7.3 L2 | HA `group`/`scene` (HA-owned) | HA-side composition over the light entities; HA fans out → §8 queue |
+
+> **Granularity rule (multi-controller scale):** the controller registers
+> **itself as one hub device** (diagnostics, `Start scan`, ESP-owned selections)
+> and **each bulb as its own device**, linked back via `"via_device": "<ctrl_id>"`
+> — HA's device registry shows controller → bulbs. Multiple controllers coexist
+> on the same broker; `<ctrl_id>` keeps them apart. Never lump several bulbs into
+> one discovery payload. The hub's `dev.cu` carries the Svelte SPA URL
+> (default `http://<board IP>/`, overridable in the Config page) so HA links
+> straight to the UI without knowing the IP.
 
 > **A group is a separate entity, not a field on the light.** The individual light
 > entity carries **no `group_id`** — a group is either its own ESP entity (room /
@@ -259,38 +268,94 @@ serves the last N lines on connect so a reconnect loses nothing.
 > ESP/bulb-internal state that powers the 1-frame room path (§7.3); it is never a
 > payload HA relies on.
 
-### 7.2 Topic Layout
+### 7.2 Topic Layout (standard device-based discovery)
+
+**Identity (stable — never derived from names):**
+- `<ctrl_id>` = `brmesh_<last 6 hex of MAC>` (e.g. `brmesh_1a2b3c`) — unique even
+  with several controllers on one broker, unchanged by rename or factory reset.
+- Bulb device id = `<ctrl_id>_l<n>` (n = the light's number — stable; never the name).
+- Runtime topic prefix = `brmesh/<ctrl_id>/…`.
+
+**Discovery namespace** — HA *device-based* discovery
+(`homeassistant/device/<uid>/config`), retained, QoS 1. HA ≥ 2026.4 key set:
+abbreviated keys (`dev` / `o` / `avty` / `cmps`), `uniq_id` on every component,
+**no `object_id`** (removed in HA 2026.4).
+
+| What | Topic |
+|------|-------|
+| Controller-hub device | `homeassistant/device/<ctrl_id>/config` — `dev` (`ids`, `name`, `mf`, `mdl`, `sw`, **`cu`** = SPA URL), `o` origin, `avty`, `cmps`: `Start scan` `button`, `scan state` / `lights registered` / `WiFi RSSI` / `MQTT link` / `queue depth` (diagnostic) sensors, (Phase 5: ESP-owned group/selection `light`s) |
+| Bulb device — one per keyed bulb | `homeassistant/device/<ctrl_id>_l<n>/config` — `dev` with `via_device: <ctrl_id>`, `cmps.main` = `light` (on/off, brightness, RGB from the state JSON; CT arrives P4.2) |
+| Removal (FR-12) | publish `""` (empty), retained, to the bulb's config topic → HA purges the device + its entities |
+
+**Runtime namespace:**
 
 | Direction | Topic | Payload |
 |-----------|-------|---------|
-| HA → ESP | `brmesh/<name>/light/<n>/cmnd/on` | `ON`/`OFF` |
-| HA → ESP | `brmesh/<name>/light/<n>/cmnd/brightness` | `0`–`255` (scaled to 0–127) |
-| HA → ESP | `brmesh/<name>/light/<n>/cmnd/rgb` | `[r,g,b]` |
-| HA → ESP | `brmesh/<name>/cmnd/scan` | `START` |
-| HA → ESP | `brmesh/<name>/group/<gid>/cmnd/<op>` | `on`/`brightness`/`rgb` — native group frame (L1) or fan-out (L2), §7.3 |
-| ESP → HA | `brmesh/<name>/light/<n>/state` | `{"on":true,"brightness":120,"rgb":[..]}` (retained, believed) |
-| ESP → HA | `brmesh/<name>/stat/<sensor>` | retained value updates |
-| Discovery | `homeassistant/light/brmesh_<n>/config`, `homeassistant/light/brmesh_room_<gid>/config`, `homeassistant/button|sensor/brmesh_<name>_<thing>/config` | published on MQTT connect, on keying, and on rename (lights); object ids stable per §7.2 — room = `brmesh_room_<gid>` (stable id, never the name) |
+| HA → ESP | `brmesh/<ctrl_id>/l<n>/set` | command JSON — `{"on":true}` / `{"brightness":0-255}` (scaled to 0–127 at TX) / `{"rgb":[r,g,b]}` / `{"ct":<kelvin>}`; subscribe `brmesh/<ctrl_id>/+/set` |
+| HA → ESP | `brmesh/<ctrl_id>/scan` | `START` (the hub button's `cmd_t`) |
+| ESP → HA | `brmesh/<ctrl_id>/status` | `"online"` / `"offline"` — birth + LWT, retained |
+| ESP → HA | `brmesh/<ctrl_id>/l<n>/availability` | `"online"` / `"offline"`, retained |
+| ESP → HA | `brmesh/<ctrl_id>/l<n>/state` | retained JSON `{"state":"ON","brightness":180,"color":[255,0,0],"ct":4000,"mode":"rgb\|white"}` — believed state (FR-05); the HA MQTT light reads `state`/`brightness`/`color` straight out of the JSON |
+| ESP → HA | `brmesh/<ctrl_id>/state` | retained controller JSON `{scan_state, lights, rssi, mqtt, queue_depth, uptime}` — one topic, each hub sensor a `val_tpl` (`{{ value_json.rssi }}`, …) |
+
+**Reference bulb payload** (the exact shape we publish):
+
+```json
+{
+  "dev": {
+    "ids": ["brmesh_1a2b3c_l1"],
+    "name": "Ceiling",
+    "mf": "BRGD",
+    "mdl": "BRMesh bulb",
+    "sw": "1.3.0",
+    "via_device": "brmesh_1a2b3c"
+  },
+  "o": { "name": "brmesh-bridge", "sw": "1.3.0" },
+  "avty": [
+    { "t": "brmesh/brmesh_1a2b3c/status" },
+    { "t": "brmesh/brmesh_1a2b3c/l1/availability" }
+  ],
+  "avty_mode": "all",
+  "cmps": {
+    "main": {
+      "p": "light",
+      "uniq_id": "brmesh_1a2b3c_l1_main",
+      "stat_t": "brmesh/brmesh_1a2b3c/l1/state",
+      "cmd_t": "brmesh/brmesh_1a2b3c/l1/set",
+      "val_tpl": "{{ value_json.state }}",
+      "bri_tpl": "{{ value_json.brightness }}",
+      "clr_tpl": "{{ value_json.color }}"
+    }
+  }
+}
+```
 
 **Rules:**
-- Believed state: entity state = last command sent; no readback exists.
-- Discovery is published **after** `mqtt->begin()` and again whenever a new bulb
-  is keyed during a scan (dynamic discovery).
-- Bulbs are broadcast-only: a command is "sent" not "confirmed" — HA optimistically
-  reflects the command, the ESP logs the send.
-- **Stable identity (zigbee2mqtt model):** the discovery **object id** is
-  `brmesh_<n>` — derived from the light's number, *never* from its name. The name is
-  only the `name` field in the discovery payload (zigbee2mqtt `friendly_name`).
-- **Rename (FR-13):** `rename <n> <text>` (console) / `PATCH /api/light/{n}` saves the
-  name to NVS and re-publishes that light's discovery config with the new `name`. HA
-  keeps the same entity (object id unchanged) and updates its name in place — no
-  orphan entity, no re-pairing. `lights registered` sensors/button are unaffected.
-- **Controller rename:** `brmesh/<name>/…` cmnd/state topics embed the controller
-  name — renaming the controller (Config page) re-publishes **all** discovery +
-  retained state so HA rebinds to the new topics.
+- **Follow HA's standard device-based schema** — abbreviated keys, `uniq_id`,
+  `via_device`, `o`, `avty` arrays with `avty_mode: "all"`. No `object_id`, no
+  per-component `homeassistant/light/<obj>/config` topics. It is plain retained
+  JSON we publish; the schema is HA's, and we conform to it.
+- **Stable identity (zigbee2mqtt model):** device `ids` + component `uniq_id` derive
+  from `<ctrl_id>` + light number — *never* from the name. The name lives only in
+  `dev.name`.
+- **Rename (FR-13):** `rename <n> <text>` (console) / `PATCH /api/light/{n}` saves
+  the name to NVS and re-publishes that bulb's config with the new `dev.name`. HA
+  keeps the same device/entities (ids unchanged) and updates the name in place — no
+  orphan, no re-pairing.
+- **Controller rename is harmless:** `<ctrl_id>` is MAC-derived, so renaming the
+  device only moves `dev.name` (one re-publish) — topics and entities don't rebind.
+- **Lifecycle:** discovery publishes **after** the MQTT connect and again whenever a
+  new bulb is keyed (dynamic discovery); the controller subscribes to
+  `homeassistant/status` and a `"online"` payload triggers a **full re-publish** of
+  discovery + retained state (HA restarted); a broker blip does the same on reconnect.
+- **Availability:** the hub `status` topic (birth/LWT) + each bulb's `availability`
+  feed the `avty` arrays (`avty_mode: "all"`), so a crash marks everything
+  unavailable, not just one entity.
+- **Believed state:** entity state = last command sent; no readback exists. Bulbs are
+  broadcast-only — HA reflects commands optimistically, the ESP logs the send.
 - **Removal (FR-12):** `del <n>` (console) / `DELETE /api/light/{n}` removes the NVS
-  entry, saves, and unpublishes that light's discovery topic (empty payload) so the HA
-  entity disappears. Note: the physical bulb keeps its key — it still obeys our
+  entry, saves, and publishes the empty-retained-payload purge above so the device
+  disappears from HA. The physical bulb keeps its key — it still obeys our
   broadcast — it is simply no longer represented; re-addable any time
   (reboot the bulb + `scan`).
 
@@ -324,11 +389,11 @@ stable — a bulb changes rooms only when it's physically moved.
 
 **L2 — virtual selection (the views).** Any overlapping selection. Two ownership
 options, both converge on the §8 queue:
-- **ESP-owned** — a `HALight` on the controller (e.g. the `All lights` fan-out,
-  FR-10). Membership in NVS; the controller expands one command into N queue
-  items, batched.
+- **ESP-owned** — a `light` component on the controller-hub device (e.g. the
+  `All lights` fan-out, FR-10). Membership in NVS; the controller expands one
+  command into N queue items, batched.
 - **HA-owned** — a HA `group`/`scene` composed over the individual light entities
-  in the HA UI (e.g. `TV rim`). HA fans out → N cmnd messages → the §8 queue.
+  in the HA UI (e.g. `TV rim`). HA fans out → N `set` messages → the §8 queue.
   Simplest for ad-hoc user selections; no controller state.
 
 **Crisp decision rule:**
@@ -358,12 +423,12 @@ view (overlapping). No re-keying, no partition conflict.
 
 FastCon is **broadcast with no acknowledgement** (CLAUDE.md §1) — bulbs never reply,
 so the queue is drained by **paced transmit slots**, not by acks. All command
-sources (HA cmnd topics, fan-out, web POSTs, serial) converge on one queue that is
+sources (MQTT `set` topics, fan-out, web POSTs, serial) converge on one queue that is
 the **sole owner of control airtime** (FR-14).
 
 ### 8.1 Problem
 
-An HA group light toggled off by the user produces **N MQTT cmnd messages within
+An HA group light toggled off by the user produces **N MQTT `set` messages within
 milliseconds** (one per member). The radio is single and time-sliced; an
 unsynchronized burst would collide with itself (and with a scan). So bursts must
 be serialized and paced.
@@ -373,7 +438,7 @@ be serialized and paced.
 | Aspect | Decision |
 |--------|----------|
 | Structure | Bounded FIFO (default **64 items**) in `MeshController`; each item = `{light n, op}` where op ∈ {on/off, brightness, rgb, ct} |
-| Sources | MQTT cmnd handlers, fan-out expansion (1 "All lights" msg → N items), `POST /api/light/{n}`, serial console — **all enqueue, none transmit directly** |
+| Sources | MQTT `set` handlers, fan-out expansion (1 "All lights" msg → N items), `POST /api/light/{n}`, serial console — **all enqueue, none transmit directly** |
 | Coalescing | Enqueue **replaces** any still-pending item for the same `(light, op-class)` → latest-wins; a spammy brightness slider leaves one item, not ten |
 | Pacer | Drain loop fires **one item per slot**; slot gap `T_TX` (default **150 ms**, NVS-tunable); each item sent **R times** (default **2** — broadcast reliability without readback) |
 | Accept semantics | Queue non-full ⇒ accepted immediately (MQTT: queued; web: `202 {queued: <pos>}`; serial: `queued`). Full ⇒ drop-oldest-per-light + log + `queue_overflow` in `/api/status` — never block the caller |
@@ -434,7 +499,7 @@ the `WebLog` ring so the same capture appears on:
 | Risk | Status | Mitigation |
 |------|--------|------------|
 | Improv vs bulb BLE stack conflict | **Largely resolved** — both are NimBLE on one host (migrated 2026-11-16, proven 2026-11-18) | Residual: Improv-WiFi-Library must compile/run on this pioarduino core and time-share the radio with our advertising. lora-relay proves the lib on the same core. Fallback: captive portal (SoftAP + DNSServer → `/setup`) |
-| `HALight`/`HAMqtt` API signatures differ from assumptions | Open | Verify against the fetched lib at first build; keep all HA calls behind one `MeshController` seam |
+| Discovery payloads rejected/ignored by HA (key names, `uniq_id` shape, availability arrays) | Open | The builder is one module pinned to the §7.2 schema (HA ≥ 2026.4 key set, no `object_id`); verify against the running HA's device registry at first build; keep all HA publishing behind that one seam |
 | HA discovery lost if entities publish before `mqtt->begin()` | Open | Keep the §5 boot order; discovery publish is one function, called after connect and after each keying |
 | Single-file Svelte bundle vs 896 KB LittleFS | Low | NFR-01 (≤ 100 KB gzipped); no heavy deps; vanilla svelte + vite + singlefile |
 | NVS `put*` silently no-ops on read-only handle | Proven gotcha | All write paths use `readOnly=false` (CLAUDE.md §2) |
@@ -480,7 +545,7 @@ NimBLE migration. This phase wires the network shell.
 | P1.1 | `web/WebServer.{h,cpp}` — `esp_http_server` startup (lora-relay config), route table, gzipped-SPA handler (embedded fallback page until Phase 2), `/ws/log` handler, `g_webServer` handle |
 | P1.2 | main.cpp boot completion per §5 (Phase 0 has the NVS → STA gating; add mDNS → httpd → loadLights()); replace the `server.handleClient()` model; wire log hooks into `WebLog` |
 | P1.3 | Console config commands: `showcfg`, `set name/sid/pass/mqtt …` → NVS — the permanent serial fallback for config (primary path is the web Config page, Phase 2). `hostname [name]` already landed in Phase 0 (Tasmota-style SetHostName; NVS `name` + live netif apply) |
-| P1.4 | platformio.ini: extend `build_src_filter` to include `web/*` (`settings.*`, `statusled.*` already build); HA lib dep stays commented until Phase 3 |
+| P1.4 | platformio.ini: extend `build_src_filter` to include `web/*` (`settings.*`, `statusled.*` already build); Phase 3 needs **no new lib** — `esp-mqtt` is an ESP-IDF core component |
 | P1.5 | Verify the single build still compiles and the proven console commands still work (NFR-03) |
 | P1.6 | Firmware version tracking (lora-relay convention): `src/FirmwareVersion.h` is the single source of truth — `FIRMWARE_VERSION` + `kBoardModel`, one current-release description block, no changelog, bump here when a phase ships. Every surface that reports a version reads it: boot banner, Improv device info, `/api/status` (`fw` + `board`). Phase 2's `tools/build_spa.py` reads the same header (lora-relay regex) and bakes it into the SPA for the version-mismatch check |
 
@@ -558,50 +623,57 @@ reset.** Follow-on asks layered on the Phase 2 surface:
 - **P2.12 UI tests** (NFR-07): the e2e gate extended to the new controls; the
   ship gate is the e2e, not "it looked fine."
 
-### Phase 3: HA Bridge
+### Phase 3: HA Bridge (standard device-based discovery)
+
+Discovery is HA's standard MQTT **device-based** schema (§7.2) — no hand-rolled
+format and no HA library: retained JSON we publish against topics HA already
+listens to.
+
+**Status (implemented 2026-11-22, live-broker verification pending — the board
+is gated on the broker being reachable; `mhost` empty ⇒ bridge disabled):**
+lives in [HaBridge.\*](src/HaBridge.cpp) (one esp-mqtt client, all publishing
+behind it). Identity: `ctrl_id = brmesh_<last 6 hex of MAC>` (broker-independent,
+always available to the console/UI), bulb device `<ctrl_id>_l<n>`, MQTT client id
+`brmesh_ctrl_<mac6>`. Hub name = NVS `mname` (empty → device `name`, shown as a
+derived value on the Config page); hub `cu` is NOT configurable — always derived
+at publish time as `http://<board IP>/` (a stored domain would not survive an IP
+change and adds nothing at the firewall). Availability: ONE LWT (`brmesh/<ctrl_id>/status` "offline",
+retained) + each bulb's `avty` is a topic **list** `[hub status, l<n>/availability]`
+with `avty_mode: "all"`, so a single LWT takes the hub and every bulb offline at
+once; bulbs forgotten while offline are queued and purged on reconnect. Light
+state JSON is HA-native (`state`/`brightness` 0–255/`color`/`color_temp`
+mireds/`color_mode`) — note this pulls P4.2's CT exposure forward, since Phase 2
+already controls the white LED in kelvin. `T_TX`/`R` are compile constants
+(`config.h`) for now, not NVS-tunable as P3.9 sketches — revisit only if field
+tuning needs it.
 
 | Task | Description |
 |------|-------------|
-| P3.1 | `HADevice` + `HAMqtt` on NVS config (host/port/user/pass from the Phase 2 config page), connect in boot after httpd; topic root `brmesh/<name>/` per §7.2; **no MQTT creds ⇒ skip this step** — web + serial keep working |
-| P3.2 | `HALight` per registered bulb: on/off, brightness (0–127), RGB — believed state per §7 |
-| P3.3 | Hand-rolled HA discovery: button `Start scan`, sensors `scan state`, `lights registered`, `WiFi RSSI`, `MQTT link`; discovery publish after `mqtt->begin()` |
-| P3.4 | `cmnd/scan` → single guarded entry point into `MeshController::startScan(seconds)` (rejects while scanning; LED blue) |
-| P3.5 | Dynamic discovery: a bulb newly keyed during a scan publishes its light-discovery + state immediately |
-| P3.6 | State sync: believed state updates pushed to HA retained topics on every send (console, web, or HA-originated); MQTT reconnect (broker blip) re-publishes all discovery + retained state |
-| P3.7 | Rename path (FR-13): `PATCH /api/light/{n}` + console `rename` — save name to NVS, re-publish discovery with stable object id `brmesh_<n>` (see §7.2) so HA renames the entity in place; verify in HA that the entity_id is unchanged and no orphan appears |
-| P3.8 | Command queue (FR-14, §8): bounded FIFO + latest-wins coalescing + pacer (`T_TX`/`R` in NVS); **route every control source (MQTT cmnd, web, serial, fan-out) through `enqueue()`** — nothing transmits directly; scan/queue exclusivity per §8.2; `queue_depth` in `/api/status`; prove with a 5-bulb group toggle: drain ~1 s, all bulbs follow, no radio contention |
+| P3.1 | **`esp-mqtt`** (ESP-IDF core `esp_mqtt_client` — its own FreeRTOS task; no third-party lib, no `lib_deps` entry) on the NVS config (host/port/user/pass from the Config page), started in boot after httpd; client config: LWT `"offline"` (retained) on `brmesh/<ctrl_id>/status`, built-in backoff reconnect + session resume, buffer sized for the discovery payloads; birth `"online"` published on connect; `<ctrl_id>` = `brmesh_<MAC last 6 hex>`; **no MQTT creds ⇒ skip this step** — web + serial keep working |
+| P3.2 | Discovery/state JSON builder (one small module, all HA publishing behind it): device-based payloads per §7.2 — abbreviated keys, `uniq_id` per component, `via_device`, `o` origin, `avty` + `avty_mode: "all"`, **no `object_id`**; publish retained QoS 1 only after the MQTT connect |
+| P3.3 | Controller-hub device `homeassistant/device/<ctrl_id>/config`: `dev` with `ids`/`name`/`mf`/`mdl`/`sw` + **`cu` = SPA URL** (default `http://<board IP>/`, overridable as an NVS setting on the Config page); `cmps`: `Start scan` button (`cmd_t` → `brmesh/<ctrl_id>/scan`), sensors `scan state` / `lights registered` / `WiFi RSSI` / `MQTT link` / `queue depth` (diagnostic) — all reading one retained `brmesh/<ctrl_id>/state` JSON via per-sensor `val_tpl` |
+| P3.4 | Bulb device per registered light `homeassistant/device/<ctrl_id>_l<n>/config` with `via_device: <ctrl_id>`; `cmps.main` = `light`: on/off + brightness (HA 0–255 ↔ wire 0–127) + RGB from the state JSON — believed state per §7 (CT exposure stays P4.2); subscribe `brmesh/<ctrl_id>/+/set`, parse the per-light command JSON → queue |
+| P3.5 | Availability: per-bulb `brmesh/<ctrl_id>/l<n>/availability` + the hub `status` topic in every `avty` array; subscribe `homeassistant/status` → on `"online"`, full re-publish of all discovery + retained state (HA-restart recovery) |
+| P3.6 | `brmesh/<ctrl_id>/scan` → single guarded entry point into `MeshController::startScan(seconds)` (rejects while scanning; LED blue) |
+| P3.7 | Dynamic discovery: a bulb newly keyed during a scan publishes its device config + retained state immediately; removal (FR-12: `del <n>` / `DELETE /api/light/{n}`) publishes an **empty retained payload** to that config topic so HA purges the device |
+| P3.8 | Rename path (FR-13): `PATCH /api/light/{n}` + console `rename` — save the name to NVS, re-publish the bulb's config with the new `dev.name` (ids/`uniq_id` unchanged, §7.2) so HA renames in place; verify in HA that the device tree under the hub is intact, entity_id unchanged, no orphan |
+| P3.9 | Command queue (FR-14, §8): bounded FIFO + latest-wins coalescing + pacer (`T_TX`/`R` in NVS); **route every control source (MQTT `set`, web, serial, fan-out) through `enqueue()`** — nothing transmits directly; scan/queue exclusivity per §8.2; `queue_depth` in `/api/status`; prove with a 5-bulb group toggle: drain ~1 s, all bulbs follow, no radio contention |
 
-**Deliverable:** With light #1 keyed, HA shows the light + controller entities:
-toggle/brightness/RGB from HA flips the physical bulb, `Start scan` runs a scan
-from HA, and `list`/`/api/status` all agree.
+**Deliverable:** With light #1 keyed, HA's device registry shows the **controller
+hub** (diagnostics + `Start scan`, and a **Control UI link** that opens the Svelte
+SPA) with the bulb **linked under it** (`via_device`): toggle/brightness/RGB from
+HA flips the physical bulb, `Start scan` runs a scan from HA, HA restart re-binds
+everything via `homeassistant/status`, and `list`/`/api/status` all agree.
 
-### Phase 4: Add / Remove Lifecycle (proof with real bulbs)
-
-The bridge must grow and shrink at runtime: a factory-new bulb found by a scan
-appears in HA without a reboot, and a light removed in the UI disappears from HA.
-Prove both directions with the on-hand factory-new stock (FR-12).
-
-| Task | Description |
-|------|-------------|
-| P4.1 | **Add proof:** power up a factory-new bulb, start a scan (HA button / web / serial) → it is keyed, added to the NVS list, and its HA entity appears live (dynamic discovery) and is controllable — no reboot |
-| P4.2 | **Multi-add proof:** repeat with a second bulb — light list grows, `lights registered` sensor tracks the count, each entity independent |
-| P4.3 | **Remove proof:** delete a light from the web Lights page (confirmation) → `DELETE /api/light/{n}` → NVS saved + discovery unpublished → the HA entity disappears; console `del <n>` gives the same result |
-| P4.4 | **Re-add:** reboot the bulb + `scan` restores its entry — the physical bulb keeps its key (removal deletes the record, not the keying) and still answers |
-| P4.5 | **Persistence:** power-cycle after add + remove → the light list is exactly right: added bulbs remain, removed one does not come back |
-
-**Deliverable:** A factory-new bulb: scan → keyed → in HA → controllable, all
-without a reboot; delete in the UI → gone from HA; re-add restores it; and the
-light list survives a power-cycle exactly as it was edited.
-
-
-### Phase 5: Groups, Colour Temperature & Polish
+### Phase 4: Groups, Colour Temperature & Polish
 
 | Task | Description |
 |------|-------------|
-| P5.1 | **Groups (two layers, §7.3):** virtual selections — `All lights` `HALight` (ESP-owned) + HA-owned scenes, both fanned out and batched through the §8 queue; **native room groups (L1, verify-first)** — capture + verify the `0x21` assign + type-3 frames on real bulbs, then assign bulbs to a room at keying and emit one group frame for whole-room ops (falls back to virtual fan-out until verified) |
-| P5.2 | Colour-temperature control: map HA mireds to the bulb CT command set (calibrated against the bulb's actual range) |
-| P5.3 | LittleFS upload endpoint (SPA replace without reflashing) |
-| P5.4 | (Optional) firmware OTA with checksum verify + rollback, per lora-relay Phase 8 |
+| P4.1 | **Groups (two layers, §7.3):** virtual selections — `All lights` as a `light` component on the hub device (ESP-owned) + HA-owned scenes, both fanned out and batched through the §8 queue; **native room groups (L1, verify-first)** — capture + verify the `0x21` assign + type-3 frames on real bulbs, then assign bulbs to a room at keying and emit one group frame for whole-room ops (falls back to virtual fan-out until verified) |
+| P4.2 | Colour-temperature control: map HA mireds to the bulb CT command set (calibrated against the bulb's actual range) |
+| P4.3 | LittleFS upload endpoint (SPA replace without reflashing) |
+| P4.4 | (Optional) firmware OTA with checksum verify + rollback, per lora-relay Phase 8 |
+| P4.5 | Update fallbackHtml to support manual firmware flash and SPA upload in case of A/B bot failed to boot for whatever reason. 
 
 **Deliverable:** A finished bridge: N individually-controllable bulbs in HA
 (add/remove proven), whole-room (native) + whole-scene (virtual) control per §7.3,
@@ -639,7 +711,7 @@ full colour control, and software-updatable UI/firmware.
 
 ## Appendix C — Finding F-CT: op `0x72` = RGB **or** WW/CW white (unified)
 
-**Date:** 2026-11-20. **Status: FIXED (2026-11-20); kelvin unit adopted 2026-11-22.** [MeshController::applyLight](src/MeshController.cpp) encodes the WW/CW crossfade from a kelvin value (`k` clamped 2700–6000 → `CW = (k−2700)*255/3300`, `WW = 255 − CW`) and both `colorTemp`/`rgb` send `d[2]=0xff` — the retired 14-bit split is gone. `ct` is now a kelvin label end-to-end (API, console, `believed_state`), stored as one 16-bit NVS value and split to the two white channels only at TX. The API/console/`believed_state`/e2e contract **did** change to kelvin (see §C.5). The fine kelvin→byte mid-curve (LUT) stays Phase 5 (P5.2).
+**Date:** 2026-11-20. **Status: FIXED (2026-11-20); kelvin unit adopted 2026-11-22.** [MeshController::applyLight](src/MeshController.cpp) encodes the WW/CW crossfade from a kelvin value (`k` clamped 2700–6000 → `CW = (k−2700)*255/3300`, `WW = 255 − CW`) and both `colorTemp`/`rgb` send `d[2]=0xff` — the retired 14-bit split is gone. `ct` is now a kelvin label end-to-end (API, console, `believed_state`), stored as one 16-bit NVS value and split to the two white channels only at TX. The API/console/`believed_state`/e2e contract **did** change to kelvin (see §C.5). The fine kelvin→byte mid-curve (LUT) stays Phase 5 (P4.2).
 
 ### C.1 What we found
 The on-hand bulbs are **RGBW**: a full RGB group **plus** a two-LED white (cool-white CW + warm-white WW), all driven by **one op `0x72`, one 8-byte payload, two mutually-exclusive modes**. That is **not** the single-axis 14-bit colour-temp the firmware currently encodes, and not a separate `colorTemp` op distinct from `rgb` — the app uses the same `0x72` command and switches modes by which channel group it sets. This is validated against the **app's own commands** (decoded under the app's key `35 30 32 32`; all frames checksum-close), captured 2026-11-20 on `70:e7…`.
@@ -692,6 +764,6 @@ Secondary (minor): the app sends `d[2]` = `0xff` (on|max-brightness) in **every*
 **Resolved (2026-11-20 white-channel fix; kelvin unit adopted 2026-11-22):**
 1. **Slider semantics — kelvin.** `colorTemp(n, k)` takes a kelvin value (`k` 2700 warm → 6000 cool) and maps it linearly **at TX** to `CW = (k−2700)*255/3300`, `WW = 255 − CW`; `k` is stored as one 16-bit `ct` and split to the two white channels only in `applyLight`. 
 2. **Kelvin range — the control unit.** 2700–6000 K is now the API/console/`believed_state` unit (the app's display label promoted to the control field); it is **not** on the air — only the 0–255 WW/CW pair is (protocol.md §2.5b).
-3. **Parameter model — kelvin end-to-end.** `colorTemp(n, k)`, console `ct <2700-6000>`, `{"ct":<kelvin>}`, and `believed_state.ct` are all kelvin now; `believed_state` keeps its `mode` (colour | white) flag + `ct`/`rgb` values. The UI slider (P2.10) sends/reads kelvin. The fine kelvin→byte mid-curve (LUT) stays Phase 5 (P5.2).
+3. **Parameter model — kelvin end-to-end.** `colorTemp(n, k)`, console `ct <2700-6000>`, `{"ct":<kelvin>}`, and `believed_state.ct` are all kelvin now; `believed_state` keeps its `mode` (colour | white) flag + `ct`/`rgb` values. The UI slider (P2.10) sends/reads kelvin. The fine kelvin→byte mid-curve (LUT) stays Phase 5 (P4.2).
 4. **`d[2]` = `0xff`** — adopted in both `colorTemp` and `rgb` (matches the air).
 5. **Reclaim first — moot.** `70:e7…` is already on our key (C.4); verify the new encoding on it directly.

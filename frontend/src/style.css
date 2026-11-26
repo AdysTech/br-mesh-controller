@@ -101,6 +101,7 @@ label.f input, label.f select { display: block; width: 100%; margin-top: 3px; }
 .light .name { font-size: 1.02rem; font-weight: 600; min-width: 0; }
 .light .name input { font-size: 1rem; font-weight: 600; max-width: 100%; }
 .light .meta { color: var(--dim); font-size: .78rem; }
+.light .nameclash { color: var(--warn); font-size: .78rem; }
 
 .switch {
   position: relative; width: 46px; height: 26px; flex: none;

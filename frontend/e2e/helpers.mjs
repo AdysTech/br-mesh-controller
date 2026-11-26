@@ -62,6 +62,25 @@ export function summary(title = 'E2E') {
   return _fail === 0;
 }
 
+// Wait for the board to come back after a reboot (restore reboots it). Polls
+// /api/status until it 2xx's or the deadline passes. Local device only — this
+// is a boot-wait, not a request retry.
+export async function waitForBoard(timeoutMs = 45000) {
+  const deadline = Date.now() + timeoutMs;
+  let last = 'no attempt yet';
+  while (Date.now() < deadline) {
+    try {
+      const r = await fetch(APP_URL + '/api/status', { cache: 'no-store', signal: AbortSignal.timeout(4000) });
+      if (r.status >= 200 && r.status < 300) {
+        return await r.json();
+      }
+      last = `HTTP ${r.status}`;
+    } catch (e) { last = e.message; }
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+  throw new Error(`board did not come back within ${timeoutMs}ms (last: ${last})`);
+}
+
 export function exitWith(okAll) { process.exit(okAll ? 0 : 1); }
 
 // ── Chrome discovery (lora-relay shape: CHROME_PATH or the puppeteer cache) ──

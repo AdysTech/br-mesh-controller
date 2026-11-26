@@ -1,15 +1,18 @@
 // Serial console driver (see console.h). See mesh.h for the actions it delegates.
 #include "console.h"
 #include "MeshController.h"
+#include "HaBridge.h"
 #include "settings.h"
 #include "web/WebLog.h"
 #include <Network.h>
+#include <esp_heap_caps.h>   // min-seen heap + largest free internal block (mem)
 #include <string.h>
 #include <stdlib.h>
 #include <ctype.h>
 
 void requestProvisioning();   // app shell (main.cpp)
 void setDeviceName(const char* name);
+extern HaBridge g_bridge;     // app shell (main.cpp); `mqtt` command + live mname
 
 void Console::banner() {
   Serial.println("---- BRMesh serial console ----");
@@ -22,18 +25,21 @@ void Console::banner() {
   Serial.println("  ct <2700-6000> [n]   colour temp in Kelvin (2700=warm → 6000=cool)");
   Serial.println("  rgb r g b [n]        colour (0-255 each)");
   Serial.println("  rename <n> <text>   rename a light (friendly name; number + id unchanged)");
+  Serial.println("  scan [sec]           re-run discovery / key new bulbs (default = configured window)");
   Serial.println("  forget <mac|n>      remove a light from our list + NVS (no air traffic; bulb's key untouched)");
-  Serial.println("  scan [sec=5]         re-run discovery / key new bulbs");
   Serial.println("  raw [sec=5]          unfiltered BLE dump (debug)");
-  Serial.println("  rawp [sec=5]         PASSIVE raw dump — best for a phone one-shot (Forget/Reset)");
+  Serial.println("  rawp [sec=5]         PASSIVE raw dump (no WAKE, debug)");
   Serial.println("  rawwake [sec=5]      WAKE broadcast + every frame (debug)");
   Serial.println("  scanstop             end a running raw scan on demand");
   Serial.println("  loglevel [lvl]       show / set log level — 0=quiet 1=normal 2=verbose (or the name)");
   Serial.println("  clear                remove all known lights (list + NVS; keeps key)");
   Serial.println("  prov                 clear saved WiFi creds + reboot into Improv");
+  Serial.println("  mem                  show heap + PSRAM memory stats (free / min-seen / largest)");
+  Serial.println("  reboot               restart the board now");
   Serial.println("  hostname [name]      show / set device name (DHCP hostname, 1-15 chars)");
+  Serial.println("  mqtt                 HA bridge status (ctrl_id, link, queue)");
   Serial.println("  showcfg              show all saved settings (passwords masked)");
-  Serial.println("  set <k> <v>          save a setting — keys: name ssid pass mhost mport muser mpass");
+  Serial.println("  set <k> <v>          save a setting — keys: name ssid pass mhost mport muser mpass mclient mname scandur");
   Serial.println("  --------------------------");
 }
 
@@ -144,7 +150,7 @@ void Console::handle(const char* line) {
   }
 
   else if (strcmp(argv[0], "scan") == 0) {
-    mesh_.requestScan((argc >= 2) ? atoi(argv[1]) : SCAN_DURATION);
+    mesh_.requestScan((argc >= 2) ? atoi(argv[1]) : loadSettings().scanSec);
     Serial.println("scan requested");
   }
   else if (strcmp(argv[0], "raw") == 0) mesh_.raw((argc >= 2) ? atoi(argv[1]) : 5);
@@ -176,6 +182,23 @@ void Console::handle(const char* line) {
     return;
   }
 
+  else if (strcmp(argv[0], "mem") == 0) {
+    Serial.printf("  heap free          : %lu KB\n", (unsigned long)(esp_get_free_heap_size() / 1024));
+    Serial.printf("  min-seen heap      : %lu KB\n", (unsigned long)(esp_get_minimum_free_heap_size() / 1024));
+    Serial.printf("  largest free (int) : %lu KB\n",
+                  (unsigned long)((uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024));
+    Serial.printf("  PSRAM              : %lu KB free / %lu KB total\n",
+                  (unsigned long)(ESP.getFreePsram() / 1024), (unsigned long)(ESP.getPsramSize() / 1024));
+    return;
+  }
+
+  else if (strcmp(argv[0], "reboot") == 0 || strcmp(argv[0], "restart") == 0) {
+    Serial.println("restarting in 2 s…");
+    delay(2000);
+    ESP.restart();
+    return;   // unreachable
+  }
+
   else if (strcmp(argv[0], "hostname") == 0) {
     if (argc < 2) {
       Serial.printf("device name (NVS 'name'): %s  —  'hostname <name>' to change\n",
@@ -188,6 +211,17 @@ void Console::handle(const char* line) {
       if (!isalnum((unsigned char)c) && c != '-') { Serial.println("only letters, digits, '-' allowed"); return; }
     setDeviceName(nm.c_str());
   }
+  else if (strcmp(argv[0], "mqtt") == 0) {
+    Serial.printf("  enabled : %s\n", g_bridge.enabled() ? "yes" : "no (set mhost to enable)");
+    if (g_bridge.enabled()) {
+      Serial.printf("  ctrl_id : %s\n", g_bridge.ctrlId().c_str());
+      Serial.printf("  link    : %s\n", g_bridge.connected() ? "online" : "offline (auto-reconnect)");
+      Serial.printf("  lights  : %d\n", (int)mesh_.lightCount());
+      Serial.printf("  queue   : depth %d, overflow %lu\n",
+                    (int)mesh_.queueDepth(), (unsigned long)mesh_.queueOverflow());
+    }
+    return;
+  }
   else if (strcmp(argv[0], "showcfg") == 0) {
     const Settings s = loadSettings();
     Serial.printf("  name    : %s\n", s.name.c_str());
@@ -198,11 +232,17 @@ void Console::handle(const char* line) {
     Serial.printf("  mport   : %d\n", s.mqttPort);
     Serial.printf("  muser   : %s\n", s.mqttUser.empty() ? "(none)" : s.mqttUser.c_str());
     Serial.printf("  mpass   : %s\n", s.mqttPass.empty() ? "(none)" : "****");
+    Serial.printf("  mclient : %s\n",
+                  s.mqttClient.empty() ? ("(derived: " + g_bridge.clientId() + ")").c_str()
+                                      : s.mqttClient.c_str());
+    Serial.printf("  mname   : %s\n",
+                  s.mqttName.empty() ? "(derived: " + s.name + ")" : s.mqttName.c_str());
+    Serial.printf("  scandur : %d s   (discovery window — SPA + HA scan)\n", s.scanSec);
   }
 
   else if (strcmp(argv[0], "set") == 0) {
     if (argc < 3) {
-      Serial.println("usage: set <name|ssid|pass|mhost|mport|muser|mpass> <value>");
+      Serial.println("usage: set <name|ssid|pass|mhost|mport|muser|mpass|mclient|mname|scandur> <value>");
       Serial.println("       ('showcfg' to see current values)");
       return;
     }
@@ -210,25 +250,36 @@ void Console::handle(const char* line) {
     const std::string v(argv[2]);
     Settings s = loadSettings();
     bool wifiTouched = false;
+    bool mqttTouched = false;
     if (strcmp(k, "name") == 0) {
       if (v.size() < 1 || v.size() > 15) { Serial.println("name must be 1-15 chars"); return; }
       for (char c : v)
         if (!isalnum((unsigned char)c) && c != '-') { Serial.println("only letters, digits, '-' allowed"); return; }
       s.name = v;
+      mqttTouched = true;    // the HA hub name falls back to `name`
     } else if (strcmp(k, "ssid") == 0 || strcmp(k, "sid") == 0) { s.ssid = v; wifiTouched = true; }
     else if (strcmp(k, "pass") == 0)                            { s.pass = v; wifiTouched = true; }
-    else if (strcmp(k, "mhost") == 0 || strcmp(k, "mqtt") == 0) { s.mqttHost = v; }
+    else if (strcmp(k, "mhost") == 0 || strcmp(k, "mqtt") == 0) { s.mqttHost = v; mqttTouched = true; }
     else if (strcmp(k, "mport") == 0) {
       int port = atoi(argv[2]);
       if (port < 1 || port > 65535) { Serial.println("port must be 1-65535"); return; }
       s.mqttPort = (uint16_t)port;
-    } else if (strcmp(k, "muser") == 0) { s.mqttUser = v; }
-    else if (strcmp(k, "mpass") == 0)  { s.mqttPass = v; }
+      mqttTouched = true;
+    } else if (strcmp(k, "muser") == 0)   { s.mqttUser = v; mqttTouched = true; }
+    else if (strcmp(k, "mpass") == 0)    { s.mqttPass = v; mqttTouched = true; }
+    else if (strcmp(k, "mclient") == 0) { s.mqttClient = v; mqttTouched = true; }
+    else if (strcmp(k, "mname") == 0)    { s.mqttName = v; mqttTouched = true; }
+    else if (strcmp(k, "scandur") == 0)  {
+      int sd = atoi(argv[2]);
+      if (sd < 1 || sd > 600) { Serial.println("scandur must be 1-600 seconds"); return; }
+      s.scanSec = sd;         // live value — no bridge update, no reboot
+    }
     else {
-      Serial.println("unknown key — one of: name ssid pass mhost mport muser mpass");
+      Serial.println("unknown key — one of: name ssid pass mhost mport muser mpass mclient mname scandur");
       return;
     }
     saveSettings(s);
+    if (mqttTouched) g_bridge.updateSettings(s);
     if (strcmp(k, "name") == 0) {
       // apply to the live netif too (same core quirk as `hostname`)
       NetworkInterface* def = Network.getDefaultInterface();
@@ -238,6 +289,8 @@ void Console::handle(const char* line) {
         Serial.printf("name '%s' saved — active from the next boot\n", s.name.c_str());
     } else if (wifiTouched) {
       Serial.printf("%s saved — press RESET to apply (STA reconnects with the new creds)\n", k);
+    } else if (mqttTouched) {
+      Serial.printf("%s saved — identity applied now; broker host/port/user/pass active from the next boot\n", k);
     } else {
       Serial.printf("%s saved\n", k);
     }

@@ -24,6 +24,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   APP_URL, test, section, assert, ok, req, summary, exitWith, findChrome,
+  waitForBoard,
 } from './helpers.mjs';
 
 const SHOT_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), 'shots');
@@ -193,7 +194,75 @@ try {
     });
   }
 
-  await shot('99-final.png');
+  // ── 6: backup → mutate → restore round-trip ────────────────────────────
+  // GET /api/backup, sanity-check the snapshot, mutate the board (rename the
+  // FIRST light — a live NVS write, no air), then POST /api/restore (reboots)
+  // and assert the mutation is REVERTED. Guards the whole portable
+  // backup/restore path end-to-end, incl. the reboot + NVS reload + HA
+  // re-publish. Uses the first light's ACTUAL number (not a literal 1 — a
+  // forgotten bulb can leave the list starting at 2).
+  //
+  // Pure-API test (no browser needed). Release the SPA's app-global /ws/log
+  // WebSocket + its HTTP keep-alives first: the board caps at
+  // max_open_sockets=12, and holding the browser's sockets open while Node
+  // fires its own requests intermittently exhausts the pool → "fetch failed".
+  await shot('99-final.png');   // final SPA screenshot while the page is live
+  await page.close();
+
+  if (status.lights > 0) {
+    await section('backup → mutate → restore round-trip (reboots the board)');
+
+    // Find a backup entry's name by light NUMBER (not vector index — a forgotten
+    // light can make l0_num != 0).
+    const backupNameFor = (bk, n) => {
+      for (let i = 0; i < (bk.ln || 0); i++)
+        if (bk[`l${i}_num`] === n) return bk[`l${i}_nm`];
+      return null;
+    };
+
+    let backup = null;
+    let targetN = null;
+
+    await test('GET /api/backup returns a valid snapshot', async () => {
+      const b = await ok(await req('GET', APP_URL + '/api/backup'));
+      assert(/^[0-9a-fA-F]{8}$/.test(b.key || ''), `bad mesh key: "${b.key}"`);
+      assert(typeof b.ln === 'number' && b.ln >= 1, `backup ln should be ≥1, got ${b.ln}`);
+      assert(typeof b.s_ssid === 'string' && b.s_ssid.length > 0, 'backup missing s_ssid');
+      backup = b;
+    });
+
+    await test('backup entry for the first light is well-formed (name + mac)', async () => {
+      const lights = await ok(await req('GET', APP_URL + '/api/lights'));
+      const first = lights.find((l) => l.n >= 1);
+      assert(first, 'no live light found');
+      targetN = first.n;
+      const i = Object.keys(backup).find((k) => k.endsWith('_num') && backup[k] === targetN);
+      assert(i, `backup has no entry with number ${targetN}`);
+      // keep the "l0_" prefix (strip only the "num" field) so l0_num -> l0_nm / l0_mac
+      const prefix = i.slice(0, -'num'.length);
+      const name = backup[`${prefix}nm`];
+      const mac = backup[`${prefix}mac`];
+      assert(typeof name === 'string' && name.length > 0, `light name empty: "${name}"`);
+      assert(/^[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}$/.test(mac || ''), `light mac malformed: "${mac}"`);
+    });
+
+    await test('mutate: rename the first light (to be reverted by restore)', async () => {
+      const marker = 'e2e-restore-check';
+      await ok(await req('PATCH', `${APP_URL}/api/light?n=${targetN}`, { name: marker }));
+      const lights = await ok(await req('GET', APP_URL + '/api/lights'));
+      const l = lights.find((x) => x.n === targetN);
+      assert(l.name === marker, `rename did not take: "${l.name}"`);
+    });
+
+    await test('POST /api/restore reboots + reverts the rename', async () => {
+      const before = backupNameFor(backup, targetN);
+      await ok(await req('POST', APP_URL + '/api/restore', backup));
+      await waitForBoard();
+      const lights = await ok(await req('GET', APP_URL + '/api/lights'));
+      const l = lights.find((x) => x.n === targetN);
+      assert(l.name === before, `restore did not revert rename: "${l.name}" != "${before}"`);
+    });
+  }
 } finally {
   if (browser) await browser.close().catch(() => {});
 }

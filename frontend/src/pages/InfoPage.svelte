@@ -31,8 +31,8 @@
     const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), ss = sec % 60;
     return (h ? h + 'h ' : '') + m + 'm ' + ss + 's';
   }
-  function heap(bytes) {
-    return bytes ? (bytes / 1024).toFixed(0) + ' KB' : '—';
+  function kb(v) {
+    return (v || v === 0) ? v + ' KB' : '—';
   }
 </script>
 
@@ -71,12 +71,25 @@
       <tr><td>IP</td><td class="mono">{s.ip}</td></tr>
       <tr><td>network</td><td>{s.ssid} · {s.rssi} dBm</td></tr>
       <tr><td>lights registered</td><td>{s.lights}</td></tr>
+      {#if s.ctrl_id}
+        <tr>
+          <td>MQTT bridge</td>
+          <td>
+            {#if s.mqtt}<span class="badge ok">online</span>
+            {:else if s.mqtt_enabled}<span class="badge mid">connecting…</span>
+            {:else}<span class="badge bad">disabled</span>{/if}
+            <span class="mono dim">{s.ctrl_id}</span>
+          </td>
+        </tr>
+      {/if}
       <tr>
         <td>scanning</td>
         <td>{#if s.scanning}<span class="badge mid">active</span>{:else}idle{/if}</td>
       </tr>
       <tr><td>uptime</td><td>{uptime(s.uptime_s)}</td></tr>
-      <tr><td>free heap</td><td>{heap(s.heap_free)}</td></tr>
+      <tr><td>free heap</td><td>{kb(s.free_heap_kb)} <span class="dim">(min-seen {kb(s.min_free_heap_kb)})</span></td></tr>
+      <tr><td>largest free block</td><td>{kb(s.largest_free_internal_block_kb)} <span class="dim">(internal)</span></td></tr>
+      <tr><td>PSRAM</td><td>{#if s.psram_size_kb}{kb(s.psram_free_kb)} free / {kb(s.psram_size_kb)} total{:else}none{/if}</td></tr>
     </tbody>
     </table>
   </div>

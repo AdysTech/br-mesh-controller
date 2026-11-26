@@ -62,13 +62,23 @@ class MeshController {
   uint8_t firstLightNumber();
 
   // ---- control (broadcast) ------------------------------------------------
-  void state(uint8_t number, bool on);
-  void brightness(uint8_t number, uint8_t level);      // 0-127
+  // Every control STAMPS the believed state and ENQUEUES the light — the pacer
+  // in loop() is the only sender (BRIDGE_PLAN §8; nothing transmits directly).
+  // Returns true when the command was accepted, false when rejected (a scan is
+  // running — the queue and the scan are mutually exclusive, §8.2).
+  bool state(uint8_t number, bool on);
+  bool brightness(uint8_t number, uint8_t level);      // 0-127
   /// Colour temperature — the separate white LED (RGBW). `t` is a Kelvin label,
   /// 2700 (warm) → 6000 (cool); split into a WW/CW crossfade only at TX
   /// (protocol.md §2.5b).
-  void colorTemp(uint8_t number, uint16_t t);
-  void rgb(uint8_t number, uint8_t r, uint8_t g, uint8_t b);
+  bool colorTemp(uint8_t number, uint16_t t);
+  bool rgb(uint8_t number, uint8_t r, uint8_t g, uint8_t b);
+
+  /// Queue a light for transmission (latest-wins per light; rejected while a
+  /// scan owns the radio). The control methods call this; drivers may too.
+  bool enqueue(uint8_t number);
+  int queueDepth() const;        // pending commands (P3.9 /api/status)
+  unsigned long queueOverflow() const;  // commands dropped for a full queue
 
   // ---- discovery / keying -------------------------------------------------
   /// WAKE + listen for factory-key bulbs, add them to the list (NO keying).
@@ -99,11 +109,31 @@ class MeshController {
   /// Restore registered lights from NVS (fires the onRegistered hook for each).
   void loadLights();
   void saveLights();
+  /// Backup/restore (web /api/restore): overwrite the stored mesh key with a
+  /// restored 4-byte key. The web handler calls this, then reboots — begin()'s
+  /// loadKeyOrGenerate() picks the restored key up and no re-keying happens.
+  void restoreKey(const uint8_t key[4]);
+  /// Replace the light list (registered entries only) and persist it. The web
+  /// restore handler calls this, then reboots so loadLights() re-fires the
+  /// onRegistered hook (HA re-publish) for the restored list.
+  void restoreLights(const std::vector<LightDevice>& lights);
 
   // ---- driver hooks -------------------------------------------------------
   /// Called whenever a light becomes registered — on key and on load. Bridge
-  /// mode uses it to create the HA entity; POC leaves it unset (no-op).
+  /// mode uses it to create the HA entity (publish discovery + retained state);
+  /// POC leaves it unset (no-op).
   void setOnRegistered(std::function<void(LightDevice&)> cb) { onRegistered_ = std::move(cb); }
+  /// Renamed by number (FR-13) — the bridge re-publishes the bulb's discovery
+  /// config with the new dev.name (ids/uniq_id unchanged, §7.2).
+  void setOnRenamed(std::function<void(uint8_t)> cb) { onRenamed_ = std::move(cb); }
+  /// Forgotten (FR-12) — the bridge purges the bulb's discovery (empty retained
+  /// payload on the config topic) so HA drops the device.
+  void setOnForgotten(std::function<void(uint8_t)> cb) { onForgotten_ = std::move(cb); }
+  /// Scan state flipped (true = a discovery/keying scan just started, false = it
+  /// just ended). The bridge re-publishes the hub state so the HA "Scan" sensor
+  /// tracks it live — isScanning_ is only true DURING the (blocking) scan, which
+  /// the periodic hub-state publish can't land within.
+  void setOnScanState(std::function<void(bool)> cb) { onScanState_ = std::move(cb); }
 
  private:
   // --- control plumbing ---
@@ -127,6 +157,7 @@ class MeshController {
   // --- persistence plumbing ---
   void loadKeyOrGenerate();
   void fireRegistered(LightDevice& l) { if (onRegistered_) onRegistered_(l); }
+  void fireScanState(bool scanning) { if (onScanState_) onScanState_(scanning); }
 
   // --- believed state (FR-05) + convergence (FR-16) ------------------------
   /// Persist a dirty believed-state (debounced — called from loop()).
@@ -162,6 +193,26 @@ class MeshController {
   NimBLEScan* pBLEScan = nullptr;
   Preferences prefs;
   std::function<void(LightDevice&)> onRegistered_;
+  std::function<void(uint8_t)>      onRenamed_;
+  std::function<void(uint8_t)>      onForgotten_;
+  std::function<void(bool)>         onScanState_;
+
+  // --- command queue (P3.9, BRIDGE_PLAN §8) --------------------------------
+  // Bounded FIFO of light NUMBERS; latest-wins per light (re-enqueue moves it
+  // to the tail). Guarded by cmdMux_ — enqueue() is called from MQTT/web/serial
+  // contexts, drained from loop(). Full queue: drop oldest, count the overflow.
+  uint8_t         cmdQueue_[CMD_QUEUE_SIZE];
+  int             cmdHead_ = 0;   // index of the oldest pending entry
+  int             cmdCount_ = 0;  // pending entries (0..CMD_QUEUE_SIZE)
+  SemaphoreHandle_t cmdMux_ = nullptr;
+  unsigned long   queueOverflowCount_ = 0;
+  // Pacer state (loop-context only): timestamp of the last TX slot sent.
+  uint32_t        lastQueueSlotMs_ = 0;
+  // Send ONE broadcast for the oldest queued light (loop-context; the caller
+  // owns the T_TX_MS gap between slots).
+  void sendOneQueuedLight();
+  // Drain as many queue slots as T_TX_MS allows this loop() pass.
+  void drainCommandQueue();
 
   bool scanRequested_ = false;
   int scanSeconds_ = SCAN_DURATION;

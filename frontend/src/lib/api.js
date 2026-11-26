@@ -23,7 +23,7 @@ export const api = {
   status: () => j('/api/status'),
   lights: () => j('/api/lights'),
 
-  scan: (seconds) => j('/api/scan', json({ seconds })),
+  scan: () => j('/api/scan', json({})),
   scanStop: () => j('/api/scan/stop'),
   raw: (sec, mode = 'active') => j('/api/raw', json({ sec, mode })),
 
@@ -40,4 +40,10 @@ export const api = {
   saveConfig: (cfg) => j('/api/config', json(cfg)),
   provision: () => j('/api/provision', { method: 'POST' }),
   factoryReset: () => j('/api/factory-reset', { method: 'POST' }),
+
+  // Portable backup/restore: the board's full state (settings + raw mesh key +
+  // light list) as a flat JSON snapshot. backup() GETs it (for download/e2e);
+  // restore() POSTs a snapshot back (the board reboots to apply it).
+  backup: () => j('/api/backup'),
+  restore: (snapshot) => j('/api/restore', json(snapshot)),
 };

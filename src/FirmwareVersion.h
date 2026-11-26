@@ -12,22 +12,35 @@
 //      check (same regex as lora-relay)
 //
 //  Rules:
-//    - Bump FIRMWARE_VERSION HERE when a phase ships.
+//    - Bump FIRMWARE_VERSION HERE after EVERY source edit (e.g. 1.3.0 ->
+//      1.3.1) so the board's running build is always identifiable via
+//      /api/status `fw` without asking which one it was flashed with.
 //    - Only the CURRENT release is described below (one short block).
 //      Do NOT accumulate a changelog here.
 //    - Commit once per phase; the version string is the contract.
 // ============================================================================
 
-#define FIRMWARE_VERSION  "1.2.2"
+#define FIRMWARE_VERSION  "1.5.4"
 
 #ifndef kBoardModel
 #define kBoardModel  "Waveshare ESP32-S3 Zero (ESP32-S3)"
 #endif
 
 // --- Current release --------------------------------------------------------
-// 1.2.2 — Colour-temp is Kelvin end-to-end: `ct` is a Kelvin label (2700 warm
-//         → 6000 cool) across the API, console, and believed_state; it is
-//         split into the WW/CW crossfade (d[6] warm, d[7] cool, d[6]+d[7]=255)
-//         only at TX. A legacy NVS `ct` is simply superseded by the next CT
-//         op — no migration.
+// 1.5.4 — the HA "Scan" sensor now tracks the scan LIVE. A discovery/keying
+//         scan blocks the app loop for its whole window, so the periodic hub-
+//         state publish (every 30 s) could never land a "scanning" state — the
+//         sensor sat at "idle" through a live scan. MeshController now fires a
+//         scan-state callback at start and finish, and the bridge re-publishes
+//         the hub state at that transition, so HA flips to "scanning" the moment
+//         a scan begins (from HA, the SPA, or the console) and back to "idle"
+//         when it ends. (1.5.3: the REST API response builders emit cJSON trees
+//         (apiSendCJson) and the SPA Discovery section is a single "Scan now"
+//         button using the configured window — the same duration the HA "Start
+//         scan" button uses; 1.5.2: the discovery window is a single operator-
+//         configured NVS "scandur" value shared by every scan path, defaulting
+//         to 30 s; 1.5.1: soft "name already used by bulb #N" hint on the
+//         Lights rename field; 1.5.0: full cJSON JSON layer; 1.4.4: HA
+//         schema:"json" state; 1.4.3: live state re-assert; 1.4.2: full RGB+CT
+//         light.)
 #endif // FIRMWARE_VERSION_H
