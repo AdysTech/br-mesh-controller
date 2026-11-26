@@ -47,6 +47,9 @@ Settings loadSettings() {
   // HA hub name (dev.name): empty = the bridge falls back to the device `name`.
   // (dev.cu is always runtime-derived as http://<board IP>/ — not stored.)
   s.mqttName = s_prefs.getString("mname", "").c_str();
+  // Discovery window (seconds). getInt is the non-logging path, so no seeding
+  // needed; the compile-time SCAN_DURATION is the fallback for first boot.
+  s.scanSec  = s_prefs.getInt("scandur", SCAN_DURATION);
   s_prefs.end();
   return s;
 }
@@ -64,6 +67,7 @@ void saveSettings(const Settings &s) {
   s_prefs.putString("mpass", s.mqttPass.c_str());
   s_prefs.putString("mclient", s.mqttClient.c_str());
   s_prefs.putString("mname", s.mqttName.c_str());
+  s_prefs.putInt("scandur", s.scanSec);
   s_prefs.end();
   LOGF("Saved settings to NVS");
 }

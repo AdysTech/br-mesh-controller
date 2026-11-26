@@ -18,6 +18,9 @@ struct Settings {
   std::string mqttPass;
   std::string mqttClient; // MQTT client id (broker-side name); empty = derived brmesh-<MAC tail>
   std::string mqttName;  // HA device name for the controller hub (dev.name; empty = use `name`)
+  int         scanSec;   // discovery window (seconds); the default every scan path uses.
+                         // NVS "scandur"; seed SCAN_DURATION (config.h). SPA Config +
+                         // HA scan button + console `scan` all read this one value.
 };
 
 Settings loadSettings();

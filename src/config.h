@@ -20,9 +20,13 @@
 // see statusled.* — no pin define here.
 
 // --- Discovery -----------------------------------------------------------------
-// How long (seconds) the initial BLE scan runs when hunting for factory-key
-// bulbs that still need keying.
-#define SCAN_DURATION    5
+// Default discovery window (seconds) — how long the WAKE+scan runs when hunting
+// for factory-keyed bulbs that need keying. This is the compile-time seed; the
+// operator-set NVS value ("scandur", settings.scanSec) wins and is what the HA
+// scan button, the SPA scan, and the console `scan` all default to. Long enough
+// to reach the power switch and cycle a fresh bulb (the pairing window only
+// opens in the seconds after power-up).
+#define SCAN_DURATION    30
 
 // --- Command queue (Phase 3, BRIDGE_PLAN §8) ------------------------------------
 // Every control (MQTT set / web / serial) ENQUEUES a light; the pacer in

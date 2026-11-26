@@ -195,6 +195,7 @@ void setup() {
   g_mesh.setOnRegistered([](LightDevice& l) { g_bridge.bulbRegistered(l); });
   g_mesh.setOnRenamed([](uint8_t n) { g_bridge.bulbRenamed(n); });
   g_mesh.setOnForgotten([](uint8_t n) { g_bridge.bulbForgotten(n); });
+  g_mesh.setOnScanState([](bool scanning) { g_bridge.notifyScanState(scanning); });
   g_mesh.loadLights();                 // restore NVS lights (no publish yet)
   g_bridge.begin(s);                   // MQTT connect -> publishAll (full list + count)
 

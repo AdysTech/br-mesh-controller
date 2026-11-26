@@ -187,53 +187,33 @@ static esp_err_t wsLogHandler(httpd_req_t *req) {
 // ----------------------------------------------------------------------------
 static esp_err_t apiStatusHandler(httpd_req_t *req) {
   const Settings s = loadSettings();
-  char buf[768];
-  int n = snprintf(buf, sizeof(buf),
-      "{\"name\":\"%s\","
-      "\"mode\":\"sta\","
-      "\"ip\":\"%s\","
-      "\"ssid\":\"%s\","
-      "\"rssi\":%d,"
-      "\"mqtt\":%s,"
-      "\"mqtt_enabled\":%s,"
-      "\"ctrl_id\":\"%s\","
-      "\"lights\":%d,"
-      "\"scanning\":%s,"
-      "\"queue_depth\":%d,"
-      "\"queue_overflow\":%lu,"
-      "\"fw\":\"%s\","
-      "\"spa\":\"%s\","
-      "\"board\":\"%s\","
-      "\"uptime_s\":%lu,"
-      "\"heap_free\":%lu,"
-      "\"free_heap_kb\":%lu,"
-      "\"min_free_heap_kb\":%lu,"
-      "\"largest_free_internal_block_kb\":%lu,"
-      "\"psram_size_kb\":%lu,"
-      "\"psram_free_kb\":%lu}",
-      jsonEscape(s.name.c_str()).c_str(),
-      WiFi.localIP().toString().c_str(),
-      jsonEscape(s.ssid.c_str()).c_str(),
-      (int)WiFi.RSSI(),
-      g_bridge.connected() ? "true" : "false",
-      g_bridge.enabled() ? "true" : "false",
-      g_bridge.ctrlId().empty() ? "" : g_bridge.ctrlId().c_str(),
-      g_mesh.lightCount(),
-      g_mesh.isScanning() ? "true" : "false",
-      g_mesh.queueDepth(),
-      (unsigned long)g_mesh.queueOverflow(),
-      FIRMWARE_VERSION,
-      jsonEscape(webSpaVersion()).c_str(),
-      kBoardModel,
-      (unsigned long)(millis() / 1000),
-      (unsigned long)ESP.getFreeHeap(),
-      (unsigned long)(esp_get_free_heap_size() / 1024),
-      (unsigned long)(esp_get_minimum_free_heap_size() / 1024),
-      (unsigned long)((uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024),
-      (unsigned long)(ESP.getPsramSize() / 1024),
-      (unsigned long)(ESP.getFreePsram() / 1024));
-  if (n < 0 || (size_t)n >= sizeof(buf)) { apiSendError(req, 500, "status build failed"); return ESP_FAIL; }
-  apiSendJson(req, 200, buf);
+  cJSON *o = cJSON_CreateObject();
+  if (!o) { apiSendError(req, 500, "status build failed"); return ESP_FAIL; }
+  cJSON_AddStringToObject(o, "name", s.name.c_str());
+  cJSON_AddStringToObject(o, "mode", "sta");
+  cJSON_AddStringToObject(o, "ip", WiFi.localIP().toString().c_str());
+  cJSON_AddStringToObject(o, "ssid", s.ssid.c_str());
+  cJSON_AddNumberToObject(o, "rssi", (int)WiFi.RSSI());
+  cJSON_AddBoolToObject(o, "mqtt", g_bridge.connected());
+  cJSON_AddBoolToObject(o, "mqtt_enabled", g_bridge.enabled());
+  cJSON_AddStringToObject(o, "ctrl_id", g_bridge.ctrlId().c_str());
+  cJSON_AddNumberToObject(o, "lights", (int)g_mesh.lightCount());
+  cJSON_AddBoolToObject(o, "scanning", g_mesh.isScanning());
+  cJSON_AddNumberToObject(o, "scandur", (int)s.scanSec);
+  cJSON_AddNumberToObject(o, "queue_depth", (int)g_mesh.queueDepth());
+  cJSON_AddNumberToObject(o, "queue_overflow", (double)g_mesh.queueOverflow());
+  cJSON_AddStringToObject(o, "fw", FIRMWARE_VERSION);
+  cJSON_AddStringToObject(o, "spa", webSpaVersion());
+  cJSON_AddStringToObject(o, "board", kBoardModel);
+  cJSON_AddNumberToObject(o, "uptime_s", (double)(millis() / 1000));
+  cJSON_AddNumberToObject(o, "heap_free", (double)ESP.getFreeHeap());
+  cJSON_AddNumberToObject(o, "free_heap_kb", (double)(esp_get_free_heap_size() / 1024));
+  cJSON_AddNumberToObject(o, "min_free_heap_kb", (double)(esp_get_minimum_free_heap_size() / 1024));
+  cJSON_AddNumberToObject(o, "largest_free_internal_block_kb",
+      (double)((uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024));
+  cJSON_AddNumberToObject(o, "psram_size_kb", (double)(ESP.getPsramSize() / 1024));
+  cJSON_AddNumberToObject(o, "psram_free_kb", (double)(ESP.getFreePsram() / 1024));
+  apiSendCJson(req, 200, o);
   return ESP_OK;
 }
 
@@ -242,83 +222,51 @@ static esp_err_t apiStatusHandler(httpd_req_t *req) {
 // ----------------------------------------------------------------------------
 static esp_err_t apiLightsHandler(httpd_req_t *req) {
   const auto &lights = g_mesh.lights();
-  std::string out = "[";
+  cJSON *arr = cJSON_CreateArray();
+  if (!arr) { apiSendError(req, 500, "lights build failed"); return ESP_FAIL; }
   for (size_t i = 0; i < lights.size(); i++) {
     const LightDevice &l = lights[i];
     // mode drives the UI picker: white (on, no colour), rgb, or ct.
     const char *mode =
         l.colorMode == 2 ? "ct" : (l.colorMode == 1 ? "rgb" : "white");
-    char item[400];
-    snprintf(item, sizeof(item),
-        "%s{\"n\":%u,"
-        "\"name\":\"%s\","
-        "\"id\":\"%s\","
-        "\"mac\":\"%s\","
-        "\"type\":\"%02X%02X\","
-        "\"features\":[\"on_off\",\"brightness\",\"rgb\",\"ct\"],"
-        "\"min_kelvin\":2700,"
-        "\"max_kelvin\":6000,"
-        "\"believed_state\":{\"on\":%s,"
-        "\"brightness\":%u,"
-        "\"rgb\":[%u,%u,%u],"
-        "\"ct\":%u,"
-        "\"mode\":\"%s\"}}",
-        i ? "," : "",
-        (unsigned)l.number,
-        jsonEscape(l.name.c_str()).c_str(),
-        jsonEscape(l.id.c_str()).c_str(),
-        jsonEscape(l.address.c_str()).c_str(),
-        l.type[0], l.type[1],
-        l.on ? "true" : "false",
-        (unsigned)l.brightness,
-        (unsigned)l.rgbR, (unsigned)l.rgbG, (unsigned)l.rgbB,
-        (unsigned)l.ct,
-        mode);
-    out += item;
+    cJSON *o = cJSON_CreateObject();
+    if (!o) { cJSON_Delete(arr); apiSendError(req, 500, "lights build failed"); return ESP_FAIL; }
+    cJSON_AddNumberToObject(o, "n", (int)l.number);
+    cJSON_AddStringToObject(o, "name", l.name.c_str());
+    cJSON_AddStringToObject(o, "id", l.id.c_str());
+    cJSON_AddStringToObject(o, "mac", l.address.c_str());
+    char type[8];
+    snprintf(type, sizeof(type), "%02X%02X", l.type[0], l.type[1]);
+    cJSON_AddStringToObject(o, "type", type);
+    if (cJSON *feat = cJSON_AddArrayToObject(o, "features")) {
+      cJSON_AddItemToArray(feat, cJSON_CreateString("on_off"));
+      cJSON_AddItemToArray(feat, cJSON_CreateString("brightness"));
+      cJSON_AddItemToArray(feat, cJSON_CreateString("rgb"));
+      cJSON_AddItemToArray(feat, cJSON_CreateString("ct"));
+    }
+    cJSON_AddNumberToObject(o, "min_kelvin", 2700);
+    cJSON_AddNumberToObject(o, "max_kelvin", 6000);
+    cJSON *bs = cJSON_AddObjectToObject(o, "believed_state");
+    cJSON_AddBoolToObject(bs, "on", l.on);
+    cJSON_AddNumberToObject(bs, "brightness", (int)l.brightness);
+    if (cJSON *rgb = cJSON_AddArrayToObject(bs, "rgb")) {
+      cJSON_AddItemToArray(rgb, cJSON_CreateNumber((double)l.rgbR));
+      cJSON_AddItemToArray(rgb, cJSON_CreateNumber((double)l.rgbG));
+      cJSON_AddItemToArray(rgb, cJSON_CreateNumber((double)l.rgbB));
+    }
+    cJSON_AddNumberToObject(bs, "ct", (int)l.ct);
+    cJSON_AddStringToObject(bs, "mode", mode);
+    cJSON_AddItemToArray(arr, o);
   }
-  out += "]";
-  apiSendJson(req, 200, out.c_str());
+  apiSendCJson(req, 200, arr);
   return ESP_OK;
 }
 
 // ----------------------------------------------------------------------------
-//  GET / (+ /*) — the SPA, or the embedded fallback while Phase 2 hasn't
-//  flashed index.html.gz into LittleFS.
+//  GET / (+ /*) — the SPA (index.html.gz in LittleFS). The SPA is now the only
+//  front-end; if the slot is empty (the SPA wasn't flashed, or LittleFS failed
+//  to mount) we return a short diagnostic instead of a stale embedded page.
 // ----------------------------------------------------------------------------
-static const char s_fallbackHtml[] =
-    "<!DOCTYPE html>\n"
-    "<html><head><meta charset=\"utf-8\">"
-    "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-    "<title>BRMesh</title>"
-    "<style>"
-    "body{font-family:system-ui,sans-serif;background:#111;color:#ddd;"
-    "margin:2rem auto;max-width:40rem;padding:0 1rem}"
-    "h1{font-size:1.3rem}"
-    "table{width:100%;border-collapse:collapse;margin-top:1rem}"
-    "td{padding:.35rem .5rem;border-bottom:1px solid #333}"
-    "td:first-child{color:#888}"
-    ".note{color:#777;font-size:.85rem;margin-top:2rem}"
-    "</style></head><body>"
-    "<h1>BRMesh <span id=\"name\"></span></h1>"
-    "<table id=\"kv\"></table>"
-    "<p>lights: <span id=\"lights\">&hellip;</span></p>"
-    "<p class=\"note\">Embedded Phase-1 status page. The Svelte SPA (Phase 2)"
-    " replaces this once <code>index.html.gz</code> is in LittleFS.</p>"
-    "<script>\n"
-    "async function ref(){try{"
-    "var s=await (await fetch('/api/status',{cache:'no-store'})).json();"
-    "document.getElementById('name').textContent=s.name;"
-    "var kv=document.getElementById('kv');kv.innerHTML='';"
-    "['mode','ip','ssid','rssi','mqtt','lights','scanning','fw','board','uptime_s','heap_free']"
-    ".forEach(function(k){kv.insertAdjacentHTML('beforeend',"
-    "'<tr><td>'+k+'</td><td>'+JSON.stringify(s[k])+'</td></tr>');});"
-    "var l=await (await fetch('/api/lights',{cache:'no-store'})).json();"
-    "document.getElementById('lights').textContent="
-    "(l.map(function(x){return '#'+x.n+' '+x.name+' '+x.mac;})).join(', ')||'(none)';"
-    "}catch(e){document.getElementById('kv').innerHTML='<tr><td>offline</td></tr>';}}"
-    "ref();setInterval(ref,5000);\n"
-    "</script></body></html>";
-
 static esp_err_t indexHandler(httpd_req_t *req) {
   // 1) LittleFS SPA: /index.html.gz. The file is gzip-compressed, so the raw
   //    bytes go out with Content-Encoding: gzip (the browser gunzips).
@@ -343,11 +291,24 @@ static esp_err_t indexHandler(httpd_req_t *req) {
     }
   }
 
-  // 2) Embedded fallback page (Phase 1).
+  // 2) The SPA slot is empty — the front-end wasn't flashed (or LittleFS failed
+  //    to mount). Return a short diagnostic so this is diagnosable, not a blank
+  //    page; the REST API under /api/* is still live.
+  const char *msg =
+      "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>BRMesh</title></head>"
+      "<body style=\"font-family:system-ui,sans-serif;background:#111;color:#ddd;"
+      "margin:3rem auto;max-width:36rem;padding:0 1rem\">"
+      "<h1 style=\"font-size:1.2rem\">SPA not found</h1>"
+      "<p>LittleFS has no <code>index.html.gz</code> — the front-end wasn't flashed. "
+      "Build + flash it with:</p>"
+      "<pre style=\"background:#000;padding:.75rem;overflow:auto\">pio run --target uploadfs</pre>"
+      "<p style=\"color:#777;font-size:.85rem\">The REST API is still live — "
+      "see <code>/api/status</code>.</p></body></html>";
   httpd_resp_set_type(req, "text/html; charset=utf-8");
   httpd_resp_set_hdr(req, "Cache-Control", "no-store, no-cache, must-revalidate");
   httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-  return httpd_resp_send(req, s_fallbackHtml, HTTPD_RESP_USE_STRLEN);
+  httpd_resp_set_status(req, "500 Internal Server Error");
+  return httpd_resp_send(req, msg, HTTPD_RESP_USE_STRLEN);
 }
 
 // ----------------------------------------------------------------------------
@@ -376,10 +337,10 @@ bool webServerInit() {
   // NOTE: on this core (pioarduino) the mountable subtype is 'spiffs' (0x40),
   // not 'fat' — same partition table shape as lora-relay (see partitions.csv).
   // Mount by PARTITION LABEL — the one-arg begin() picks a core-default label
-  // that is not in our table (mount fails → SPA path falls back to the inline
-  // HTML). lora-relay's shape: (readOnly, path, maxOpen, label).
+  // that is not in our table (a failed mount just means / has no SPA to serve).
+  // lora-relay's shape: (readOnly, path, maxOpen, label).
   if (!LittleFS.begin(true, "/littlefs", 10, "spa_a")) {
-    LOGE("web: LittleFS mount FAILED — SPA path will use the embedded fallback");
+    LOGE("web: LittleFS mount FAILED — the SPA will NOT be served (/ shows the hint)");
   } else {
     LOGF("web: LittleFS up  (%lu KB total, %lu KB free)",
          (unsigned long)(LittleFS.totalBytes() / 1024),

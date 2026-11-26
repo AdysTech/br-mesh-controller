@@ -34,8 +34,9 @@
   let renaming = $state(0); // n being renamed, 0 = none
   let renameText = $state('');
 
-  // scan section
-  let scanSec = $state(12);
+  // scan section. The window is the board's CONFIGURED value (Config → Discovery)
+  // — the SAME duration the HA "Start scan" button uses. This button just fires
+  // the scan; there's no per-scan duration override here.
   let scanning = $state(false);
   let scanBusy = $state(false);
   let liveTail = $state([]);
@@ -108,6 +109,19 @@
     catch (e) { err = String(e); }
   }
 
+  // Soft duplicate-name hint (WARN, never block): while renaming bulb l, if the
+  // typed name already belongs to another controllable bulb, return that bulb's
+  // number so the template can say "name already used by bulb #N". We surface
+  // the collision but never block the commit — HA keeps the two distinct by the
+  // slot-number unique_id (…_l<N>), the name is only the friendly label. 0 = none.
+  function nameClash(l) {
+    const t = renameText.trim().toLowerCase();
+    if (!t) return 0;
+    for (const o of controllable)
+      if (o.n !== l.n && o.name.trim().toLowerCase() === t) return o.n;
+    return 0;
+  }
+
   async function remove(l) {
     if (!confirm(`Forget light #${l.n} “${l.name}”?\nIt is only removed from THIS controller's list; the bulb keeps its key and will be re-keyed if scanned again.`)) return;
     err = note = '';
@@ -119,8 +133,8 @@
   async function startScan() {
     scanBusy = true; err = note = '';
     try {
-      await api.scan(scanSec);
-      note = `scan queued — power-cycle any NEW bulb during the ${scanSec}s window to catch it`;
+      await api.scan();
+      note = 'scan queued — power-cycle any NEW bulb during the window to catch it';
       refreshScan();
     } catch (e) { err = String(e); }
     scanBusy = false;
@@ -162,12 +176,14 @@
   <div class="light">
     <div class="head">
       {#if renaming === l.n}
+        {@const clash = nameClash(l)}
         <span class="name">
           <input value={renameText} oninput={(e) => (renameText = e.target.value)}
                  onkeyup={(e) => e.key === 'Enter' && commitRename(l)}
                  onblur={() => commitRename(l)} autofocus />
           <button class="tiny" onclick={() => (renaming = 0)}>cancel</button>
         </span>
+        {#if clash}<span class="nameclash">name already used by bulb #{clash}</span>{/if}
       {:else}
         <span class="name">#{l.n} · {l.name}</span>
       {/if}
@@ -212,16 +228,14 @@
 <div class="panel">
   <h2>Discovery — key a new bulb</h2>
   <div class="row">
-    <label class="f" style="width:auto">seconds
-      <input type="number" min="3" max="120" bind:value={scanSec} />
-    </label>
     <button class="primary" disabled={scanBusy || scanning} onclick={startScan}>
-      {scanning ? 'scanning…' : 'start scan'}
+      {scanning ? 'scanning…' : 'Scan now'}
     </button>
     {#if scanning}<button disabled={scanBusy} onclick={stopScan}>stop</button>{/if}
     <span class="dim">
-      fresh bulbs only advertise in the seconds after power-up —
-      power-cycle the bulb while scanning
+      uses the configured window (Config → Discovery) — the same duration the HA
+      "Start scan" button uses. Fresh bulbs only advertise after power-up —
+      cycle the bulb while scanning.
     </span>
   </div>
   {#if scanning}

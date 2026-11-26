@@ -25,8 +25,8 @@ void Console::banner() {
   Serial.println("  ct <2700-6000> [n]   colour temp in Kelvin (2700=warm → 6000=cool)");
   Serial.println("  rgb r g b [n]        colour (0-255 each)");
   Serial.println("  rename <n> <text>   rename a light (friendly name; number + id unchanged)");
+  Serial.println("  scan [sec]           re-run discovery / key new bulbs (default = configured window)");
   Serial.println("  forget <mac|n>      remove a light from our list + NVS (no air traffic; bulb's key untouched)");
-  Serial.println("  scan [sec=5]         re-run discovery / key new bulbs");
   Serial.println("  raw [sec=5]          unfiltered BLE dump (debug)");
   Serial.println("  rawp [sec=5]         PASSIVE raw dump (no WAKE, debug)");
   Serial.println("  rawwake [sec=5]      WAKE broadcast + every frame (debug)");
@@ -39,7 +39,7 @@ void Console::banner() {
   Serial.println("  hostname [name]      show / set device name (DHCP hostname, 1-15 chars)");
   Serial.println("  mqtt                 HA bridge status (ctrl_id, link, queue)");
   Serial.println("  showcfg              show all saved settings (passwords masked)");
-  Serial.println("  set <k> <v>          save a setting — keys: name ssid pass mhost mport muser mpass mclient mname");
+  Serial.println("  set <k> <v>          save a setting — keys: name ssid pass mhost mport muser mpass mclient mname scandur");
   Serial.println("  --------------------------");
 }
 
@@ -150,7 +150,7 @@ void Console::handle(const char* line) {
   }
 
   else if (strcmp(argv[0], "scan") == 0) {
-    mesh_.requestScan((argc >= 2) ? atoi(argv[1]) : SCAN_DURATION);
+    mesh_.requestScan((argc >= 2) ? atoi(argv[1]) : loadSettings().scanSec);
     Serial.println("scan requested");
   }
   else if (strcmp(argv[0], "raw") == 0) mesh_.raw((argc >= 2) ? atoi(argv[1]) : 5);
@@ -237,11 +237,12 @@ void Console::handle(const char* line) {
                                       : s.mqttClient.c_str());
     Serial.printf("  mname   : %s\n",
                   s.mqttName.empty() ? "(derived: " + s.name + ")" : s.mqttName.c_str());
+    Serial.printf("  scandur : %d s   (discovery window — SPA + HA scan)\n", s.scanSec);
   }
 
   else if (strcmp(argv[0], "set") == 0) {
     if (argc < 3) {
-      Serial.println("usage: set <name|ssid|pass|mhost|mport|muser|mpass|mclient|mname> <value>");
+      Serial.println("usage: set <name|ssid|pass|mhost|mport|muser|mpass|mclient|mname|scandur> <value>");
       Serial.println("       ('showcfg' to see current values)");
       return;
     }
@@ -268,8 +269,13 @@ void Console::handle(const char* line) {
     else if (strcmp(k, "mpass") == 0)    { s.mqttPass = v; mqttTouched = true; }
     else if (strcmp(k, "mclient") == 0) { s.mqttClient = v; mqttTouched = true; }
     else if (strcmp(k, "mname") == 0)    { s.mqttName = v; mqttTouched = true; }
+    else if (strcmp(k, "scandur") == 0)  {
+      int sd = atoi(argv[2]);
+      if (sd < 1 || sd > 600) { Serial.println("scandur must be 1-600 seconds"); return; }
+      s.scanSec = sd;         // live value — no bridge update, no reboot
+    }
     else {
-      Serial.println("unknown key — one of: name ssid pass mhost mport muser mpass mclient mname");
+      Serial.println("unknown key — one of: name ssid pass mhost mport muser mpass mclient mname scandur");
       return;
     }
     saveSettings(s);

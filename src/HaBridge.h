@@ -57,6 +57,11 @@ class HaBridge {
   /// Forgotten (FR-12): purge the bulb's discovery (empty retained payload)
   /// so HA drops the device — even when the purge happens offline.
   void bulbForgotten(uint8_t number);
+  /// Scan state flipped (started/ended): re-publish the hub state so the HA
+  /// "Scan" sensor tracks it live. isScanning_ is only true during the blocking
+  /// scan, which the periodic hub-state publish can't land within — so we push
+  /// the state at the transition instead. (publishHubState reads the live flag.)
+  void notifyScanState(bool scanning);
 
   // ---- introspection (web /api/status, console) ---------------------------
   bool enabled() const { return enabled_; }

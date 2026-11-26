@@ -8,6 +8,7 @@
     name: 'brmesh', ssid: '', pass: '',
     mhost: '', mport: 1883, muser: '', mpass: '',
     mclient: '', mname: '',
+    scandur: 30,   // discovery window (seconds) — shared by the SPA scan + HA scan button
   });
   let mclientNow = $state('');
   let ctrlId = $state('');
@@ -32,6 +33,7 @@
         mpass: c.mpass ?? '',
         mclient: c.mclient ?? '',
         mname: c.mname ?? '',
+        scandur: c.scandur ?? 30,
       };
       mclientNow = c.mqtt_client ?? '';
       ctrlId = c.ctrl_id ?? '';
@@ -149,6 +151,25 @@
     new network, not this one.
   </div>
   <button class="primary" disabled={busy} onclick={save}>save device config</button>
+</div>
+
+<div class="panel">
+  <h2>Discovery</h2>
+  <div class="row" style="align-items:flex-start">
+    <label class="f" style="flex:0 0 12rem">scan window (seconds)
+      <input type="number" min="1" max="600" bind:value={cfg.scandur} />
+    </label>
+    <span class="dim" style="padding-top:18px">
+      how long a discovery / key scan stays open — the value BOTH the
+      Lights-page scan and the Home Assistant scan button use. long enough to
+      reach the power switch and cycle a fresh bulb.
+    </span>
+  </div>
+  <div class="note info" style="margin:0 0 10px">
+    fresh bulbs only advertise in the seconds after power-up, so this window
+    has to outlast your trip to the switch. applies immediately (no reboot).
+  </div>
+  <button class="primary" disabled={busy} onclick={save}>save discovery config</button>
 </div>
 
 <div class="panel">

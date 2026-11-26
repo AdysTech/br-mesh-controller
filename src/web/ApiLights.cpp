@@ -14,32 +14,41 @@
 #include "config.h"
 #include "MeshController.h"
 #include "ApiHttp.h"
+#include "settings.h"   // loadSettings().scanSec — the configured discovery window
 
 extern MeshController g_mesh;
 
 // ----------------------------------------------------------------------------
 //  POST /api/scan  {"seconds":N} — request discovery + key new bulbs.
 //  requestScan() queues it; loop() runs it (one scan at a time, §9).
+//  Default window = the operator's configured value (Config page / NVS scandur);
+//  an explicit "seconds" body value overrides it (one-off long/short scan).
 // ----------------------------------------------------------------------------
 static esp_err_t apiScanPostHandler(httpd_req_t *req) {
   if (!g_mesh.started()) { apiSendError(req, 503, "engine offline (provisioning mode)"); return ESP_FAIL; }
   if (g_mesh.isScanning()) { apiSendError(req, 409, "a scan is already running"); return ESP_FAIL; }
 
-  int seconds = SCAN_DURATION;
+  int seconds = loadSettings().scanSec;
   int v = apiJsonInt(apiReadBody(req, 256), "seconds");
-  if (v > 0) seconds = (v > 120) ? 120 : v;   // sanity cap
+  if (v > 0) seconds = (v > 600) ? 600 : v;   // explicit override: sanity cap
+  if (seconds < 1) seconds = 1;
 
   g_mesh.requestScan(seconds);
-  char buf[96];
-  int n = snprintf(buf, sizeof(buf), "{\"queued\":true,\"seconds\":%d}", seconds);
-  apiSendJson(req, 202, buf);
+  cJSON *o = cJSON_CreateObject();
+  if (!o) { apiSendError(req, 500, "scan build failed"); return ESP_FAIL; }
+  cJSON_AddBoolToObject(o, "queued", true);
+  cJSON_AddNumberToObject(o, "seconds", seconds);
+  apiSendCJson(req, 202, o);
   return ESP_OK;
 }
 
 // POST /api/scan/stop — end a running scan/capture early (console 'scanstop').
 static esp_err_t apiScanStopHandler(httpd_req_t *req) {
   g_mesh.scanStop();
-  apiSendJson(req, 200, "{\"stopped\":true}");
+  cJSON *o = cJSON_CreateObject();
+  if (!o) { apiSendError(req, 500, "scan build failed"); return ESP_FAIL; }
+  cJSON_AddBoolToObject(o, "stopped", true);
+  apiSendCJson(req, 200, o);
   return ESP_OK;
 }
 
@@ -108,9 +117,11 @@ static esp_err_t apiLightPostHandler(httpd_req_t *req) {
     return ESP_FAIL;
   }
 
-  char buf[96];
-  int n = snprintf(buf, sizeof(buf), "{\"sent\":true,\"n\":%d}", num);
-  apiSendJson(req, 200, buf);
+  cJSON *o = cJSON_CreateObject();
+  if (!o) { apiSendError(req, 500, "light build failed"); return ESP_FAIL; }
+  cJSON_AddBoolToObject(o, "sent", true);
+  cJSON_AddNumberToObject(o, "n", num);
+  apiSendCJson(req, 200, o);
   return ESP_OK;
 }
 
@@ -129,10 +140,11 @@ static esp_err_t apiLightPatchHandler(httpd_req_t *req) {
     apiSendError(req, 404, "no such light (see /api/lights)");
     return ESP_FAIL;
   }
-  char buf[128];
-  int n = snprintf(buf, sizeof(buf), "{\"renamed\":%d,\"name\":\"%s\"}", num,
-                   jsonEscape(name.c_str()).c_str());
-  apiSendJson(req, 200, buf);
+  cJSON *o = cJSON_CreateObject();
+  if (!o) { apiSendError(req, 500, "light build failed"); return ESP_FAIL; }
+  cJSON_AddNumberToObject(o, "renamed", num);
+  cJSON_AddStringToObject(o, "name", name.c_str());
+  apiSendCJson(req, 200, o);
   return ESP_OK;
 }
 
@@ -147,9 +159,10 @@ static esp_err_t apiLightDeleteHandler(httpd_req_t *req) {
   if (!lightExists((uint8_t)num)) { apiSendError(req, 404, "no such light (see /api/lights)"); return ESP_FAIL; }
 
   g_mesh.forget(std::to_string(num));
-  char buf[64];
-  int n = snprintf(buf, sizeof(buf), "{\"deleted\":%d}", num);
-  apiSendJson(req, 200, buf);
+  cJSON *o = cJSON_CreateObject();
+  if (!o) { apiSendError(req, 500, "light build failed"); return ESP_FAIL; }
+  cJSON_AddNumberToObject(o, "deleted", num);
+  apiSendCJson(req, 200, o);
   return ESP_OK;
 }
 

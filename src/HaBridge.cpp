@@ -6,112 +6,64 @@
 #include <string>
 
 #include "config.h"
-#include "web/ApiHttp.h"   // the tiny flat-JSON readers (apiJsonString / apiJsonInt)
+#include "settings.h"      // loadSettings() — the configured discovery window
+#include <cJSON.h>         // ESP-IDF-bundled cJSON (framework libs) — parses the /set command
 #include "web/WebLog.h"    // LOGE / LOGF / LOGD
 
 // ============================================================================
-//  Small JSON helpers (no JSON lib on the board).
+//  JSON in + out. The incoming /set command is PARSED with the ESP-IDF-bundled
+//  cJSON (see applyLightCommand); the emitted payloads (state + device
+//  discovery) are BUILT as cJSON trees and serialized with
+//  cJSON_PrintUnformatted (jsonOut below) — no hand-rolled escaping, no fixed
+//  snprintf buffers on the stack (those become heap, freed one-shot).
 // ============================================================================
 namespace {
 
-/// Bounded JSON string escape (lora memory practice): copy s into out with the
-/// minimal escapes (\" \\ \n \r \t, control bytes as \u00xx). Returns true and
-/// NUL-terminates on success; false if it would not fit. Keeps discovery JSON to
-/// ONE bounded buffer + a single snprintf instead of a chain of std::string
-/// temporaries (each of which is a small heap alloc/free that fragments the
-/// pool over a soak). Names are short (≤ ~15), so a small cap is plenty.
-bool jesc(char* out, size_t cap, const char* in) {
-  if (!out || cap == 0) return false;
-  size_t o = 0;
-  auto put = [&](const char* s, size_t n) {
-    if (o + n > cap - 1) { o = cap; return; }   // overflow → stop, flag truncated
-    memcpy(out + o, s, n);
-    o += n;
-  };
-  for (const unsigned char* p = (const unsigned char*)in; *p && o < cap; ++p) {
-    unsigned char c = *p;
-    if (c == '"')           put("\\\"", 2);
-    else if (c == '\\')     put("\\\\", 2);
-    else if (c == '\n')     put("\\n", 2);
-    else if (c == '\r')     put("\\r", 2);
-    else if (c == '\t')     put("\\t", 2);
-    else if (c < 0x20) { char t[8]; int n = snprintf(t, sizeof(t), "\\u%04x", (int)c); put(t, (size_t)n); }
-    else                  put((char*)&c, 1);
+/// Serialize a fully-built cJSON tree into a compact (unformatted) std::string
+/// and release it: free the print buffer (cJSON_free) and the tree
+/// (cJSON_Delete). Returns "" on a null tree or a failed print. This is what the
+/// discovery + state builders return — cJSON owns the escaping, and the heap is
+/// one-shot (build → print → free) instead of fixed snprintf stack buffers.
+std::string jsonOut(cJSON* root) {
+  char* s = root ? cJSON_PrintUnformatted(root) : nullptr;
+  if (!s) {
+    if (root) cJSON_Delete(root);
+    return {};
   }
-  if (o >= cap) return false;
-  out[o] = 0;
-  return true;
+  std::string out(s);
+  cJSON_free(s);
+  cJSON_Delete(root);
+  return out;
 }
 
 /// A light's retained state JSON — the exact shape HA's `schema:"json"` light
 /// reads (and the shape HA itself sends to the /set topic: uppercase "ON"/"OFF"
-/// and an object `{"r","g","b"}` colour). Two things were leaving the entity
-/// "Unknown": the state was lowercase "on" (HA's wire convention is uppercase),
-/// and both `color` and `color_temp` were sent together. Emit a clean state:
-/// uppercase ON/OFF, brightness on the HA 0-255 scale (the wire is 0-127), and
-/// ONLY the active colour attribute — the RGB object when colour_mode is "rgb",
-/// mireds when it is "color_temp".
+/// and an object `{"r","g","b"}` colour). Emit a clean state: uppercase ON/OFF,
+/// brightness on the HA 0-255 scale (the wire is 0-127), and ONLY the active
+/// colour attribute — the RGB object when colour_mode is "rgb", mireds when it
+/// is "color_temp".
 std::string lightStateJson(const LightDevice& l) {
-  if (!l.on)
-    return "{\"state\":\"OFF\"}";
-  const int haBri = (int)l.brightness * 255 / 127;
-  char buf[160];
-  if (l.colorMode == 1) {
-    // Active mode is RGB: send the colour-wheel value as the object form HA
-    // uses, omit color_temp so HA never sees a conflicting colour.
-    snprintf(buf, sizeof(buf),
-             "{\"state\":\"ON\",\"brightness\":%d,"
-             "\"color\":{\"r\":%d,\"g\":%d,\"b\":%d},\"color_mode\":\"rgb\"}",
-             haBri, (int)l.rgbR, (int)l.rgbG, (int)l.rgbB);
-  } else {
-    // Active mode is colour temperature (the white LED): send mireds, omit the
-    // colour. colourMode 0 (never set) defaults to the white LED.
-    const int mireds = 1000000 / (l.ct ? (int)l.ct : 4000);
-    snprintf(buf, sizeof(buf),
-             "{\"state\":\"ON\",\"brightness\":%d,"
-             "\"color_temp\":%d,\"color_mode\":\"color_temp\"}",
-             haBri, mireds);
+  cJSON* j = cJSON_CreateObject();
+  if (!j) return {};
+  cJSON_AddStringToObject(j, "state", l.on ? "ON" : "OFF");
+  if (l.on) {
+    cJSON_AddNumberToObject(j, "brightness", (int)l.brightness * 255 / 127);
+    if (l.colorMode == 1) {
+      // Active mode is RGB: send the colour-wheel value as the object form HA
+      // uses, omit color_temp so HA never sees a conflicting colour.
+      cJSON* c = cJSON_AddObjectToObject(j, "color");
+      cJSON_AddNumberToObject(c, "r", (int)l.rgbR);
+      cJSON_AddNumberToObject(c, "g", (int)l.rgbG);
+      cJSON_AddNumberToObject(c, "b", (int)l.rgbB);
+      cJSON_AddStringToObject(j, "color_mode", "rgb");
+    } else {
+      // Active mode is colour temperature (the white LED): send mireds, omit the
+      // colour. colourMode 0 (never set) defaults to the white LED.
+      cJSON_AddNumberToObject(j, "color_temp", 1000000 / (l.ct ? (int)l.ct : 4000));
+      cJSON_AddStringToObject(j, "color_mode", "color_temp");
+    }
   }
-  return buf;
-}
-
-/// Parse a colour from a command on the /set topic. HA is the sole publisher of
-/// this topic, and its `schema:"json"` light sends the object form
-/// {"color":{"r":..,"g":..,"b":..}} (verified against the broker's own /set
-/// payload) — that is the only shape we accept.
-bool parseColor(const String& body, uint8_t& r, uint8_t& g, uint8_t& b) {
-  size_t p = body.indexOf("\"color\"");
-  if (p == -1) return false;
-  size_t colon = body.indexOf(':', p);
-  if (colon == -1 || body[colon + 1] != '{') return false;   // object form only
-
-  // readNum: from a key position, find its ':', then the next integer.
-  auto readNum = [&](size_t keyPos, char* out, size_t outSz) -> bool {
-    size_t c = body.indexOf(':', keyPos);
-    if (c == -1) return false;
-    size_t i = c + 1;
-    while (i < body.length() && (body[i] == ' ' || body[i] == '\t')) i++;
-    if (i < body.length() && body[i] == '-') i++;
-    size_t s = i;
-    while (i < body.length() && body[i] >= '0' && body[i] <= '9') i++;
-    if (s == i) return false;
-    size_t n = (i - s < outSz - 1) ? (i - s) : (outSz - 1);
-    for (size_t k = 0; k < n; k++) out[k] = body[s + k];
-    out[n] = 0;
-    return true;
-  };
-  size_t pr = body.indexOf("\"r\"", p);
-  size_t pg = body.indexOf("\"g\"", p);
-  size_t pb = body.indexOf("\"b\"", p);
-  if (pr == -1 || pg == -1 || pb == -1) return false;
-  char rr[16], gg[16], bb[16];
-  if (!readNum(pr, rr, sizeof(rr))) return false;
-  if (!readNum(pg, gg, sizeof(gg))) return false;
-  if (!readNum(pb, bb, sizeof(bb))) return false;
-  r = (uint8_t)atoi(rr);
-  g = (uint8_t)atoi(gg);
-  b = (uint8_t)atoi(bb);
-  return true;
+  return jsonOut(j);
 }
 
 } // namespace
@@ -148,73 +100,79 @@ void HaBridge::purge(const std::string& topic) {
 }
 
 std::string HaBridge::hubDiscoveryJson() const {
-  // Bounded single-snprintf build (lora memory practice) — no std::string
-  // churn. Escape the two dynamic strings once into small buffers, then emit
-  // the whole discovery document from ONE bounded buffer (safe on the 8 KB
-  // MQTT task stack).
-  char idE[48];    if (!jesc(idE, sizeof(idE), ctrlId_.c_str()))   idE[0] = 0;
-  char nameE[48];  if (!jesc(nameE, sizeof(nameE), hubName_.c_str())) nameE[0] = 0;
-  char base[64];   snprintf(base, sizeof(base), "brmesh/%s/", idE);
-  char stateT[80]; snprintf(stateT, sizeof(stateT), "%sstate", base);
-  // dev.cu is always the board's own SPA, derived live — a stored domain adds
-  // nothing (the firewall routes by IP either way), and re-publish tracks IP changes.
-  char cu[48];     snprintf(cu, sizeof(cu), "http://%s/", WiFi.localIP().toString().c_str());
-
-  char buf[2048];
   // HA MQTT device-discovery schema (validated against HA core's abbreviations +
   // discovery schemas, HA ≥ 2026.4): device id is `ids` (a LIST), model is `mdl`,
   // `cmps`/components is a DICT keyed by a stable component id (not an array), and
   // each component names its platform with `p` (not `type`). Device-class is
-  // `dev_cla`, unit is `unit_of_meas`, icon is `ic`. Full key names also accepted;
-  // we use the abbreviations (smaller payloads).
-  int n = snprintf(buf, sizeof(buf),
-    "{\"o\":{\"name\":\"brmesh\",\"sw\":\"%s\"},"
-    "\"dev\":{"
-    "\"ids\":[\"%s\"],"
-    "\"name\":\"%s\","
-    "\"cu\":\"%s\","
-    "\"mf\":\"Waveshare\",\"mdl\":\"ESP32-S3-Zero\",\"sw\":\"%s\"},"
-    "\"avty\":[{\"t\":\"%sstatus\"}],\"avty_mode\":\"all\","
-    "\"cmps\":{"
-    "\"scan_btn\":{\"p\":\"button\",\"uniq_id\":\"%s_scan_btn\","
-    "\"name\":\"Start scan\",\"cmd_t\":\"%sscan\"},"
-    "\"scan\":{\"p\":\"sensor\",\"uniq_id\":\"%s_scan\",\"name\":\"Scan\",\"stat_t\":\"%s\","
-    "\"val_tpl\":\"{{ value_json.scan }}\","
-    "\"ent_cat\":\"diagnostic\",\"ic\":\"mdi:radar\"},"
-    "\"lights\":{\"p\":\"sensor\",\"uniq_id\":\"%s_lights\",\"name\":\"Lights\",\"stat_t\":\"%s\","
-    "\"val_tpl\":\"{{ value_json.lights }}\","
-    "\"ent_cat\":\"diagnostic\",\"ic\":\"mdi:led-strip-variant\"},"
-    "\"rssi\":{\"p\":\"sensor\",\"uniq_id\":\"%s_rssi\",\"name\":\"WiFi RSSI\",\"stat_t\":\"%s\","
-    "\"val_tpl\":\"{{ value_json.rssi }}\",\"unit_of_meas\":\"dBm\","
-    "\"ent_cat\":\"diagnostic\",\"ic\":\"mdi:wifi\"},"
-    "\"mqtt\":{\"p\":\"sensor\",\"uniq_id\":\"%s_mqtt\",\"name\":\"MQTT link\",\"stat_t\":\"%s\","
-    "\"val_tpl\":\"{{ value_json.mqtt }}\","
-    "\"ent_cat\":\"diagnostic\",\"ic\":\"mdi:lan\"},"
-    "\"queue\":{\"p\":\"sensor\",\"uniq_id\":\"%s_queue\",\"name\":\"Queue depth\",\"stat_t\":\"%s\","
-    "\"val_tpl\":\"{{ value_json.queue }}\","
-    "\"ent_cat\":\"diagnostic\",\"ic\":\"mdi:queue\"}}}",
-    FIRMWARE_VERSION,
-    idE, nameE, cu, FIRMWARE_VERSION,
-    base,
-    idE, base,
-    idE, stateT,
-    idE, stateT,
-    idE, stateT,
-    idE, stateT,
-    idE, stateT);
-  if (n < 0 || (size_t)n >= sizeof(buf))
-    LOGE("MQTT: hub discovery JSON truncated (n=%d cap=%zu)", n, sizeof(buf));
-  return buf;
+  // `dev_cla`, unit is `unit_of_meas`, icon is `ic`. We use the abbreviations
+  // (smaller payloads). The whole document is a cJSON tree — escaping is cJSON's,
+  // not ours.
+  const std::string base   = "brmesh/" + ctrlId_ + "/";
+  const std::string stateT = base + "state";
+  // dev.cu is always the board's own SPA, derived live — a stored domain adds
+  // nothing (the firewall routes by IP either way), and re-publish tracks IP changes.
+  const std::string cu = "http://" + std::string(WiFi.localIP().toString().c_str()) + "/";
+
+  cJSON* root = cJSON_CreateObject();
+  if (!root) return {};
+
+  // "o" — object (name + firmware).
+  cJSON* o = cJSON_AddObjectToObject(root, "o");
+  cJSON_AddStringToObject(o, "name", "brmesh");
+  cJSON_AddStringToObject(o, "sw", FIRMWARE_VERSION);
+
+  // "dev" — the hub device: id list, name, own-SPA URL, manufacturer/model/sw.
+  cJSON* dev = cJSON_AddObjectToObject(root, "dev");
+  cJSON* ids = cJSON_AddArrayToObject(dev, "ids");
+  cJSON_AddItemToArray(ids, cJSON_CreateString(ctrlId_.c_str()));
+  cJSON_AddStringToObject(dev, "name", hubName_.c_str());
+  cJSON_AddStringToObject(dev, "cu", cu.c_str());
+  cJSON_AddStringToObject(dev, "mf", "Waveshare");
+  cJSON_AddStringToObject(dev, "mdl", "ESP32-S3-Zero");
+  cJSON_AddStringToObject(dev, "sw", FIRMWARE_VERSION);
+
+  // "avty" — hub status only (covered by the single LWT); avty_mode "all".
+  cJSON* avty = cJSON_AddArrayToObject(root, "avty");
+  cJSON* av0 = cJSON_CreateObject();
+  cJSON_AddStringToObject(av0, "t", (base + "status").c_str());
+  cJSON_AddItemToArray(avty, av0);
+  cJSON_AddStringToObject(root, "avty_mode", "all");
+
+  // "cmps" — components (a dict keyed by a stable component id).
+  cJSON* cmps = cJSON_AddObjectToObject(root, "cmps");
+
+  // scan_btn — the button that triggers a scan.
+  cJSON* btn = cJSON_AddObjectToObject(cmps, "scan_btn");
+  cJSON_AddStringToObject(btn, "p", "button");
+  cJSON_AddStringToObject(btn, "uniq_id", (ctrlId_ + "_scan_btn").c_str());
+  cJSON_AddStringToObject(btn, "name", "Start scan");
+  cJSON_AddStringToObject(btn, "cmd_t", (base + "scan").c_str());
+
+  // The five diagnostic sensors all read the hub state topic via value_json.<key>.
+  auto sensor = [this, cmps, &stateT](const char* key, const char* suffix,
+                                      const char* name, const char* ic,
+                                      const char* unit) {
+    cJSON* s = cJSON_AddObjectToObject(cmps, key);
+    cJSON_AddStringToObject(s, "p", "sensor");
+    cJSON_AddStringToObject(s, "uniq_id", (ctrlId_ + suffix).c_str());
+    cJSON_AddStringToObject(s, "name", name);
+    cJSON_AddStringToObject(s, "stat_t", stateT.c_str());
+    const std::string tpl = std::string("{{ value_json.") + key + " }}";
+    cJSON_AddStringToObject(s, "val_tpl", tpl.c_str());
+    cJSON_AddStringToObject(s, "ent_cat", "diagnostic");
+    cJSON_AddStringToObject(s, "ic", ic);
+    if (unit) cJSON_AddStringToObject(s, "unit_of_meas", unit);
+  };
+  sensor("scan",   "_scan",   "Scan",        "mdi:radar",             nullptr);
+  sensor("lights", "_lights", "Lights",      "mdi:led-strip-variant", nullptr);
+  sensor("rssi",   "_rssi",   "WiFi RSSI",   "mdi:wifi",              "dBm");
+  sensor("mqtt",   "_mqtt",   "MQTT link",   "mdi:lan",               nullptr);
+  sensor("queue",  "_queue",  "Queue depth", "mdi:queue",             nullptr);
+
+  return jsonOut(root);
 }
 
 std::string HaBridge::bulbDiscoveryJson(const LightDevice& l) const {
-  // Bounded single-snprintf build (lora memory practice) — no std::string churn.
-  char idE[48];    if (!jesc(idE, sizeof(idE), ctrlId_.c_str()))   idE[0] = 0;
-  char nameE[48];  if (!jesc(nameE, sizeof(nameE), l.name.c_str())) nameE[0] = 0;
-  char devId[64];  snprintf(devId, sizeof(devId), "%s_l%d", idE, (int)l.number);
-  char base[64];   snprintf(base, sizeof(base), "brmesh/%s/", idE);
-
-  char buf[768];
   // Same device-discovery schema as the hub: `ids` LIST, `mdl`, `cmps` a DICT
   // keyed by a component id, component platform under `p` (not `type`). The
   // light is `schema:"json"` — HA reads/writes native JSON keys (state,
@@ -222,34 +180,54 @@ std::string HaBridge::bulbDiscoveryJson(const LightDevice& l) const {
   // supported_color_modes advertises BOTH rgb and color_temp so the whole gamut
   // (colour wheel + temp slider) always shows; min/max mireds bound the temp
   // (166–370 = 6000–2700 K, the bulbs' 2700–6000 K range).
-  int n = snprintf(buf, sizeof(buf),
-    "{\"o\":{\"name\":\"brmesh\",\"sw\":\"%s\"},"
-    "\"dev\":{"
-    "\"ids\":[\"%s\"],"
-    "\"name\":\"%s\","
-    "\"via_device\":\"%s\","
-    "\"mf\":\"BroadLink\",\"mdl\":\"BRMesh bulb\"},"
-    // Availability list: hub status (covered by the single LWT) + the bulb's
-    // own topic. avty_mode "all" = both must be "online" → one LWT takes hub
-    // AND every bulb offline at once.
-    "\"avty\":[{\"t\":\"%sstatus\"},{\"t\":\"%sl%d/availability\"}],\"avty_mode\":\"all\","
-    "\"cmps\":{\"light\":{\"p\":\"light\",\"name\":\"%s\","
-    "\"uniq_id\":\"%s\","
-    "\"stat_t\":\"%sl%d/state\","
-    "\"cmd_t\":\"%sl%d/set\","
-    "\"schema\":\"json\","
-    "\"sup_clrm\":[\"rgb\",\"color_temp\"],"
-    "\"min_mirs\":166,\"max_mirs\":370}}}",
-    FIRMWARE_VERSION,
-    devId, nameE, idE,
-    base, base, (int)l.number,   // avty[0] = base+"status"; avty[1] = base+"l<N>/availability"
-    nameE,                      // cmps.light.name (entity name = the SPA bulb name)
-    devId,                      // cmps.light.uniq_id
-    base, (int)l.number,        // stat_t = base+"l<N>/state"
-    base, (int)l.number);       // cmd_t  = base+"l<N>/set"
-  if (n < 0 || (size_t)n >= sizeof(buf))
-    LOGE("MQTT: bulb #%u discovery JSON truncated (n=%d cap=%zu)", l.number, n, sizeof(buf));
-  return buf;
+  const std::string devId = ctrlId_ + "_l" + std::to_string(l.number);
+  const std::string base  = "brmesh/" + ctrlId_ + "/";
+  const std::string sub   = base + "l" + std::to_string(l.number) + "/";
+
+  cJSON* root = cJSON_CreateObject();
+  if (!root) return {};
+
+  // "o" — object (name + firmware).
+  cJSON* o = cJSON_AddObjectToObject(root, "o");
+  cJSON_AddStringToObject(o, "name", "brmesh");
+  cJSON_AddStringToObject(o, "sw", FIRMWARE_VERSION);
+
+  // "dev" — the bulb device, chained to the hub (via_device).
+  cJSON* dev = cJSON_AddObjectToObject(root, "dev");
+  cJSON* ids = cJSON_AddArrayToObject(dev, "ids");
+  cJSON_AddItemToArray(ids, cJSON_CreateString(devId.c_str()));
+  cJSON_AddStringToObject(dev, "name", l.name.c_str());
+  cJSON_AddStringToObject(dev, "via_device", ctrlId_.c_str());
+  cJSON_AddStringToObject(dev, "mf", "BroadLink");
+  cJSON_AddStringToObject(dev, "mdl", "BRMesh bulb");
+
+  // Availability list: hub status (covered by the single LWT) + the bulb's own
+  // topic. avty_mode "all" = both must be "online" → one LWT takes hub AND every
+  // bulb offline at once.
+  cJSON* avty = cJSON_AddArrayToObject(root, "avty");
+  cJSON* av0 = cJSON_CreateObject();
+  cJSON_AddStringToObject(av0, "t", (base + "status").c_str());
+  cJSON* av1 = cJSON_CreateObject();
+  cJSON_AddStringToObject(av1, "t", (sub + "availability").c_str());
+  cJSON_AddItemToArray(avty, av0);
+  cJSON_AddItemToArray(avty, av1);
+  cJSON_AddStringToObject(root, "avty_mode", "all");
+
+  // "cmps.light" — the light component.
+  cJSON* light = cJSON_AddObjectToObject(cJSON_AddObjectToObject(root, "cmps"), "light");
+  cJSON_AddStringToObject(light, "p", "light");
+  cJSON_AddStringToObject(light, "name", l.name.c_str());
+  cJSON_AddStringToObject(light, "uniq_id", devId.c_str());
+  cJSON_AddStringToObject(light, "stat_t", (sub + "state").c_str());
+  cJSON_AddStringToObject(light, "cmd_t", (sub + "set").c_str());
+  cJSON_AddStringToObject(light, "schema", "json");
+  cJSON* clrm = cJSON_AddArrayToObject(light, "sup_clrm");
+  cJSON_AddItemToArray(clrm, cJSON_CreateString("rgb"));
+  cJSON_AddItemToArray(clrm, cJSON_CreateString("color_temp"));
+  cJSON_AddNumberToObject(light, "min_mirs", 166);
+  cJSON_AddNumberToObject(light, "max_mirs", 370);
+
+  return jsonOut(root);
 }
 
 void HaBridge::publishHub() {
@@ -262,17 +240,15 @@ void HaBridge::publishBulbDiscovery(const LightDevice& l) {
 }
 
 void HaBridge::publishHubState() {
-  char buf[160];
-  snprintf(buf, sizeof(buf),
-           "{\"scan\":\"%s\",\"lights\":%d,\"rssi\":%d,\"mqtt\":\"%s\","
-           "\"queue\":%d,\"queue_overflow\":%lu}",
-           mesh_.isScanning() ? "scanning" : "idle",
-           mesh_.lightCount(),
-           (int)WiFi.RSSI(),
-           connected_ ? "online" : "offline",
-           mesh_.queueDepth(),
-           mesh_.queueOverflow());
-  pub(hubStateTopic(), buf, true);
+  cJSON* j = cJSON_CreateObject();
+  if (!j) return;
+  cJSON_AddStringToObject(j, "scan", mesh_.isScanning() ? "scanning" : "idle");
+  cJSON_AddNumberToObject(j, "lights", (int)mesh_.lightCount());
+  cJSON_AddNumberToObject(j, "rssi", (int)WiFi.RSSI());
+  cJSON_AddStringToObject(j, "mqtt", connected_ ? "online" : "offline");
+  cJSON_AddNumberToObject(j, "queue", (int)mesh_.queueDepth());
+  cJSON_AddNumberToObject(j, "queue_overflow", (unsigned long)mesh_.queueOverflow());
+  pub(hubStateTopic(), jsonOut(j), true);
 }
 
 void HaBridge::publishAll() {
@@ -365,11 +341,12 @@ void HaBridge::begin(const Settings& s) {
   cfg.session.keepalive = 30;
   cfg.network.reconnect_timeout_ms = 10000;
   cfg.task.priority = 4;
-  // The CONNECTED event runs our discovery publish IN THIS task: hubDiscoveryJson
-  // puts a 2 KB buffer on the stack, bulbDiscoveryJson 768 B, plus snprintf's own
-  // frames, on top of esp-mqtt's frames — a ~3 KB peak. 16 KB leaves a wide margin
-  // over that. (The earlier infinite-reboot crash was NOT the stack — it was a
-  // missing snprintf %s arg in bulbDiscoveryJson; the stack was never the limit.)
+  // The CONNECTED event runs our discovery publish IN THIS task. The JSON builders
+  // allocate their cJSON trees + print buffers on the heap (freed one-shot via
+  // jsonOut), not on the stack, so this task's peak is esp-mqtt's own frames plus
+  // small frames for the build loop — well within 16 KB. (The earlier
+  // infinite-reboot crash was NOT the stack — it was a missing snprintf %s arg in
+  // bulbDiscoveryJson; the stack was never the limit.)
   cfg.task.stack_size = 16384;
   cfg.buffer.size = 4096;
   cfg.buffer.out_size = 4096;
@@ -446,7 +423,7 @@ void HaBridge::handleData(const esp_mqtt_event_t* e) {
   }
   if (topic == scanTopic()) {
     LOGF("MQTT: scan requested from HA");
-    mesh_.requestScan(SCAN_DURATION);
+    mesh_.requestScan(loadSettings().scanSec);  // the operator-configured window
     return;
   }
   // brmesh/<ctrl_id>/l<n>/set — extract <n>.
@@ -466,13 +443,35 @@ void HaBridge::handleData(const esp_mqtt_event_t* e) {
 /// Fields are INDEPENDENT — brightness is applied alongside colour/CT (HA sends
 /// them together). Order: state, then brightness, then colour (wins) or CT.
 void HaBridge::applyLightCommand(uint8_t n, const std::string& body) {
-  const String b(body.c_str());
-  std::string st = apiJsonString(b, "state");
-  for (auto& c : st) c = (char)tolower((unsigned char)c);   // HA may send ON/OFF
-  const int bri = apiJsonInt(b, "brightness");      // -1 = absent (HA scale 0-255)
-  const int mireds = apiJsonInt(b, "color_temp");   // -1 = absent (HA mireds)
+  cJSON* root = cJSON_Parse(body.c_str());
+  if (!root) {
+    LOGE("MQTT: set #%u — unparseable JSON: %.120s", n, body.c_str());
+    return;
+  }
+  // HA `schema:"json"` sends uppercase "ON"/"OFF" (or "TOGGLE"); normalise.
+  std::string st;
+  if (const cJSON* s = cJSON_GetObjectItem(root, "state");
+      s && cJSON_IsString(s) && s->valuestring) {
+    st = s->valuestring;
+    for (auto& c : st) c = (char)tolower((unsigned char)c);
+  }
+  const cJSON* briItem = cJSON_GetObjectItem(root, "brightness");   // -1 = absent (HA 0-255)
+  const cJSON* ctItem  = cJSON_GetObjectItem(root, "color_temp");   // -1 = absent (mireds)
+  const int bri    = (briItem && cJSON_IsNumber(briItem)) ? (int)briItem->valuedouble : -1;
+  const int mireds = (ctItem  && cJSON_IsNumber(ctItem))  ? (int)ctItem->valuedouble  : -1;
   uint8_t r = 0, g = 0, bl = 0;
-  const bool hasColor = parseColor(b, r, g, bl);
+  bool hasColor = false;
+  if (const cJSON* col = cJSON_GetObjectItem(root, "color"); col && cJSON_IsObject(col)) {
+    auto pick = [](const cJSON* o, const char* k) -> int {
+      const cJSON* v = cJSON_GetObjectItem(o, k);
+      return (v && cJSON_IsNumber(v)) ? (int)v->valuedouble : -1;
+    };
+    const int ri = pick(col, "r"), gi = pick(col, "g"), bi = pick(col, "b");
+    if (ri >= 0 && gi >= 0 && bi >= 0) {
+      r = (uint8_t)ri; g = (uint8_t)gi; bl = (uint8_t)bi; hasColor = true;
+    }
+  }
+  cJSON_Delete(root);
   LOGD("MQTT: set #%u state=%s bri=%d mireds=%d rgb=%d",
        n, st.c_str(), bri, mireds, (int)hasColor);
 
@@ -545,6 +544,14 @@ void HaBridge::bulbForgotten(uint8_t number) {
     pendingPurge_[pendingPurgeCount_++] = number;
   xSemaphoreGive(purgeMux_);
   LOGF("MQTT: purge of #%u deferred (offline)", number);
+}
+
+void HaBridge::notifyScanState(bool scanning) {
+  if (!enabled_ || !connected_) return;
+  // Re-reads isScanning() itself — the flag is already set by the time this
+  // fires (it's driven from MeshController::loop() at the exact transition).
+  publishHubState();
+  LOGF("MQTT: hub state refreshed (scan %s)", scanning ? "scanning" : "idle");
 }
 
 // ============================================================================

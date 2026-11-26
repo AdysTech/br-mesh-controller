@@ -42,7 +42,7 @@
 | FR-06 | A raw FastCon packet-capture path shall exist on serial **and** in the web console, triggerable from the UI (field path for new bulb models) | Mandatory |
 | FR-07 | Key, light list, and all config (name, WiFi, MQTT) shall persist in NVS across reboots; no re-keying on power-cycle | Mandatory |
 | FR-08 | The serial console (POC command set: `list`, `sel`, `on/off/ct/rgb`, `scan`, `raw`…) shall keep working in bridge mode | Mandatory |
-| FR-09 | Colour + white control (bulbs advertise type `2A A8`) — **the on-hand bulbs are RGBW**: one op `0x72`, one 8-byte payload, two mutually-exclusive modes — **RGB** (`d[3]=B,d[4]=R,d[5]=G`, white off) **or** **WW/CW white crossfade** (`d[6]=CW, d[7]=255−CW`, RGB off), not a single-axis CT ([protocol.md](protocol.md) §2.5b): the UI ships a colour/white control in Phase 2 (P2.10), and the firmware now encodes the correct unified `0x72` wire (RGB or CW/WW crossfade, `d[2]=0xff`) — **Finding F-CT fixed 2026-11-20**, kelvin unit adopted 2026-11-22 (Appendix C): `ct` is a kelvin label (2700–6000 K) end-to-end, split to the WW/CW crossfade only at TX. Remaining: the fine kelvin→byte mid-curve (LUT) is Phase 5 (P5.2) | Phase 2 UI (P2.10) + correct wire + kelvin unit (done); fine mid-curve LUT Phase 5 (P5.2) |
+| FR-09 | Colour + white control (bulbs advertise type `2A A8`) — **the on-hand bulbs are RGBW**: one op `0x72`, one 8-byte payload, two mutually-exclusive modes — **RGB** (`d[3]=B,d[4]=R,d[5]=G`, white off) **or** **WW/CW white crossfade** (`d[6]=CW, d[7]=255−CW`, RGB off), not a single-axis CT ([protocol.md](protocol.md) §2.5b): the UI ships a colour/white control in Phase 2 (P2.10), and the firmware now encodes the correct unified `0x72` wire (RGB or CW/WW crossfade, `d[2]=0xff`) — **Finding F-CT fixed 2026-11-20**, kelvin unit adopted 2026-11-22 (Appendix C): `ct` is a kelvin label (2700–6000 K) end-to-end, split to the WW/CW crossfade only at TX. Remaining: the fine kelvin→byte mid-curve (LUT) is Phase 5 (P4.2) | Phase 2 UI (P2.10) + correct wire + kelvin unit (done); fine mid-curve LUT Phase 5 (P4.2) |
 | FR-10 | "All lights" **virtual selection** (ESP-owned fan-out entity, every keyed bulb) — §7.3 L2 | Later (Phase 5) |
 | FR-15 | **Native room groups (§7.3 L1):** a bulb is assigned to a physical room at keying; whole-room command = one FastCon group frame. **Verify-first** on the `0x21` assign + type-3 group frames (not yet in protocol.md); until verified, a room group is a virtual selection (L2) | Later (Phase 5, gated on verification) |
 | FR-16 | **State convergence:** a bulb is broadcast-only and may have missed a command (unpowered when we sent it), so the controller shall re-transmit each light's last known state on a fixed cadence (default ~10 s, tunable) so the air converges to what the user set; off must stay off (never re-send a colour frame to an off bulb); skipped while scanning (radio is time-sliced) | Phase 2 (P2.9) |
@@ -246,7 +246,7 @@ serves the last N lines on connect so a reconnect loses nothing.
 
 | Entity | HA component | Lives on which device |
 |--------|-------------|-----------------------|
-| One light per keyed bulb (user-renamable, FR-13) — on/off, brightness, RGB first; CT in Phase 5 (P5.2) | `light` | **the bulb's own device** `homeassistant/device/<ctrl_id>_l<n>/config`, linked back with `via_device` (§7.2) |
+| One light per keyed bulb (user-renamable, FR-13) — on/off, brightness, RGB first; CT in Phase 5 (P4.2) | `light` | **the bulb's own device** `homeassistant/device/<ctrl_id>_l<n>/config`, linked back with `via_device` (§7.2) |
 | `Start scan` | `button` | controller-hub device |
 | `Scan state` (IDLE/SCANNING/KEYING), `Lights registered`, `WiFi RSSI`, `MQTT link`, `Queue depth` (diagnostic) | `sensor` | controller-hub device |
 | **Room group** (physical, e.g. `living_room`) — §7.3 L1 | `light` (ESP-owned) | controller-hub device; native group frame = **1 TX** once `0x21`/type-3 verified; else L2 batched fan-out (Phase 5) |
@@ -284,7 +284,7 @@ abbreviated keys (`dev` / `o` / `avty` / `cmps`), `uniq_id` on every component,
 | What | Topic |
 |------|-------|
 | Controller-hub device | `homeassistant/device/<ctrl_id>/config` — `dev` (`ids`, `name`, `mf`, `mdl`, `sw`, **`cu`** = SPA URL), `o` origin, `avty`, `cmps`: `Start scan` `button`, `scan state` / `lights registered` / `WiFi RSSI` / `MQTT link` / `queue depth` (diagnostic) sensors, (Phase 5: ESP-owned group/selection `light`s) |
-| Bulb device — one per keyed bulb | `homeassistant/device/<ctrl_id>_l<n>/config` — `dev` with `via_device: <ctrl_id>`, `cmps.main` = `light` (on/off, brightness, RGB from the state JSON; CT arrives P5.2) |
+| Bulb device — one per keyed bulb | `homeassistant/device/<ctrl_id>_l<n>/config` — `dev` with `via_device: <ctrl_id>`, `cmps.main` = `light` (on/off, brightness, RGB from the state JSON; CT arrives P4.2) |
 | Removal (FR-12) | publish `""` (empty), retained, to the bulb's config topic → HA purges the device + its entities |
 
 **Runtime namespace:**
@@ -642,7 +642,7 @@ retained) + each bulb's `avty` is a topic **list** `[hub status, l<n>/availabili
 with `avty_mode: "all"`, so a single LWT takes the hub and every bulb offline at
 once; bulbs forgotten while offline are queued and purged on reconnect. Light
 state JSON is HA-native (`state`/`brightness` 0–255/`color`/`color_temp`
-mireds/`color_mode`) — note this pulls P5.2's CT exposure forward, since Phase 2
+mireds/`color_mode`) — note this pulls P4.2's CT exposure forward, since Phase 2
 already controls the white LED in kelvin. `T_TX`/`R` are compile constants
 (`config.h`) for now, not NVS-tunable as P3.9 sketches — revisit only if field
 tuning needs it.
@@ -652,7 +652,7 @@ tuning needs it.
 | P3.1 | **`esp-mqtt`** (ESP-IDF core `esp_mqtt_client` — its own FreeRTOS task; no third-party lib, no `lib_deps` entry) on the NVS config (host/port/user/pass from the Config page), started in boot after httpd; client config: LWT `"offline"` (retained) on `brmesh/<ctrl_id>/status`, built-in backoff reconnect + session resume, buffer sized for the discovery payloads; birth `"online"` published on connect; `<ctrl_id>` = `brmesh_<MAC last 6 hex>`; **no MQTT creds ⇒ skip this step** — web + serial keep working |
 | P3.2 | Discovery/state JSON builder (one small module, all HA publishing behind it): device-based payloads per §7.2 — abbreviated keys, `uniq_id` per component, `via_device`, `o` origin, `avty` + `avty_mode: "all"`, **no `object_id`**; publish retained QoS 1 only after the MQTT connect |
 | P3.3 | Controller-hub device `homeassistant/device/<ctrl_id>/config`: `dev` with `ids`/`name`/`mf`/`mdl`/`sw` + **`cu` = SPA URL** (default `http://<board IP>/`, overridable as an NVS setting on the Config page); `cmps`: `Start scan` button (`cmd_t` → `brmesh/<ctrl_id>/scan`), sensors `scan state` / `lights registered` / `WiFi RSSI` / `MQTT link` / `queue depth` (diagnostic) — all reading one retained `brmesh/<ctrl_id>/state` JSON via per-sensor `val_tpl` |
-| P3.4 | Bulb device per registered light `homeassistant/device/<ctrl_id>_l<n>/config` with `via_device: <ctrl_id>`; `cmps.main` = `light`: on/off + brightness (HA 0–255 ↔ wire 0–127) + RGB from the state JSON — believed state per §7 (CT exposure stays P5.2); subscribe `brmesh/<ctrl_id>/+/set`, parse the per-light command JSON → queue |
+| P3.4 | Bulb device per registered light `homeassistant/device/<ctrl_id>_l<n>/config` with `via_device: <ctrl_id>`; `cmps.main` = `light`: on/off + brightness (HA 0–255 ↔ wire 0–127) + RGB from the state JSON — believed state per §7 (CT exposure stays P4.2); subscribe `brmesh/<ctrl_id>/+/set`, parse the per-light command JSON → queue |
 | P3.5 | Availability: per-bulb `brmesh/<ctrl_id>/l<n>/availability` + the hub `status` topic in every `avty` array; subscribe `homeassistant/status` → on `"online"`, full re-publish of all discovery + retained state (HA-restart recovery) |
 | P3.6 | `brmesh/<ctrl_id>/scan` → single guarded entry point into `MeshController::startScan(seconds)` (rejects while scanning; LED blue) |
 | P3.7 | Dynamic discovery: a bulb newly keyed during a scan publishes its device config + retained state immediately; removal (FR-12: `del <n>` / `DELETE /api/light/{n}`) publishes an **empty retained payload** to that config topic so HA purges the device |
@@ -665,33 +665,15 @@ SPA) with the bulb **linked under it** (`via_device`): toggle/brightness/RGB fro
 HA flips the physical bulb, `Start scan` runs a scan from HA, HA restart re-binds
 everything via `homeassistant/status`, and `list`/`/api/status` all agree.
 
-### Phase 4: Add / Remove Lifecycle (proof with real bulbs)
-
-The bridge must grow and shrink at runtime: a factory-new bulb found by a scan
-appears in HA without a reboot, and a light removed in the UI disappears from HA.
-Prove both directions with the on-hand factory-new stock (FR-12).
+### Phase 4: Groups, Colour Temperature & Polish
 
 | Task | Description |
 |------|-------------|
-| P4.1 | **Add proof:** power up a factory-new bulb, start a scan (HA button / web / serial) → it is keyed, added to the NVS list, and its HA entity appears live (dynamic discovery) and is controllable — no reboot |
-| P4.2 | **Multi-add proof:** repeat with a second bulb — light list grows, `lights registered` sensor tracks the count, each entity independent |
-| P4.3 | **Remove proof:** delete a light from the web Lights page (confirmation) → `DELETE /api/light/{n}` → NVS saved + discovery unpublished → the HA entity disappears; console `del <n>` gives the same result |
-| P4.4 | **Re-add:** reboot the bulb + `scan` restores its entry — the physical bulb keeps its key (removal deletes the record, not the keying) and still answers |
-| P4.5 | **Persistence:** power-cycle after add + remove → the light list is exactly right: added bulbs remain, removed one does not come back |
-
-**Deliverable:** A factory-new bulb: scan → keyed → in HA → controllable, all
-without a reboot; delete in the UI → gone from HA; re-add restores it; and the
-light list survives a power-cycle exactly as it was edited.
-
-
-### Phase 5: Groups, Colour Temperature & Polish
-
-| Task | Description |
-|------|-------------|
-| P5.1 | **Groups (two layers, §7.3):** virtual selections — `All lights` as a `light` component on the hub device (ESP-owned) + HA-owned scenes, both fanned out and batched through the §8 queue; **native room groups (L1, verify-first)** — capture + verify the `0x21` assign + type-3 frames on real bulbs, then assign bulbs to a room at keying and emit one group frame for whole-room ops (falls back to virtual fan-out until verified) |
-| P5.2 | Colour-temperature control: map HA mireds to the bulb CT command set (calibrated against the bulb's actual range) |
-| P5.3 | LittleFS upload endpoint (SPA replace without reflashing) |
-| P5.4 | (Optional) firmware OTA with checksum verify + rollback, per lora-relay Phase 8 |
+| P4.1 | **Groups (two layers, §7.3):** virtual selections — `All lights` as a `light` component on the hub device (ESP-owned) + HA-owned scenes, both fanned out and batched through the §8 queue; **native room groups (L1, verify-first)** — capture + verify the `0x21` assign + type-3 frames on real bulbs, then assign bulbs to a room at keying and emit one group frame for whole-room ops (falls back to virtual fan-out until verified) |
+| P4.2 | Colour-temperature control: map HA mireds to the bulb CT command set (calibrated against the bulb's actual range) |
+| P4.3 | LittleFS upload endpoint (SPA replace without reflashing) |
+| P4.4 | (Optional) firmware OTA with checksum verify + rollback, per lora-relay Phase 8 |
+| P4.5 | Update fallbackHtml to support manual firmware flash and SPA upload in case of A/B bot failed to boot for whatever reason. 
 
 **Deliverable:** A finished bridge: N individually-controllable bulbs in HA
 (add/remove proven), whole-room (native) + whole-scene (virtual) control per §7.3,
@@ -729,7 +711,7 @@ full colour control, and software-updatable UI/firmware.
 
 ## Appendix C — Finding F-CT: op `0x72` = RGB **or** WW/CW white (unified)
 
-**Date:** 2026-11-20. **Status: FIXED (2026-11-20); kelvin unit adopted 2026-11-22.** [MeshController::applyLight](src/MeshController.cpp) encodes the WW/CW crossfade from a kelvin value (`k` clamped 2700–6000 → `CW = (k−2700)*255/3300`, `WW = 255 − CW`) and both `colorTemp`/`rgb` send `d[2]=0xff` — the retired 14-bit split is gone. `ct` is now a kelvin label end-to-end (API, console, `believed_state`), stored as one 16-bit NVS value and split to the two white channels only at TX. The API/console/`believed_state`/e2e contract **did** change to kelvin (see §C.5). The fine kelvin→byte mid-curve (LUT) stays Phase 5 (P5.2).
+**Date:** 2026-11-20. **Status: FIXED (2026-11-20); kelvin unit adopted 2026-11-22.** [MeshController::applyLight](src/MeshController.cpp) encodes the WW/CW crossfade from a kelvin value (`k` clamped 2700–6000 → `CW = (k−2700)*255/3300`, `WW = 255 − CW`) and both `colorTemp`/`rgb` send `d[2]=0xff` — the retired 14-bit split is gone. `ct` is now a kelvin label end-to-end (API, console, `believed_state`), stored as one 16-bit NVS value and split to the two white channels only at TX. The API/console/`believed_state`/e2e contract **did** change to kelvin (see §C.5). The fine kelvin→byte mid-curve (LUT) stays Phase 5 (P4.2).
 
 ### C.1 What we found
 The on-hand bulbs are **RGBW**: a full RGB group **plus** a two-LED white (cool-white CW + warm-white WW), all driven by **one op `0x72`, one 8-byte payload, two mutually-exclusive modes**. That is **not** the single-axis 14-bit colour-temp the firmware currently encodes, and not a separate `colorTemp` op distinct from `rgb` — the app uses the same `0x72` command and switches modes by which channel group it sets. This is validated against the **app's own commands** (decoded under the app's key `35 30 32 32`; all frames checksum-close), captured 2026-11-20 on `70:e7…`.
@@ -782,6 +764,6 @@ Secondary (minor): the app sends `d[2]` = `0xff` (on|max-brightness) in **every*
 **Resolved (2026-11-20 white-channel fix; kelvin unit adopted 2026-11-22):**
 1. **Slider semantics — kelvin.** `colorTemp(n, k)` takes a kelvin value (`k` 2700 warm → 6000 cool) and maps it linearly **at TX** to `CW = (k−2700)*255/3300`, `WW = 255 − CW`; `k` is stored as one 16-bit `ct` and split to the two white channels only in `applyLight`. 
 2. **Kelvin range — the control unit.** 2700–6000 K is now the API/console/`believed_state` unit (the app's display label promoted to the control field); it is **not** on the air — only the 0–255 WW/CW pair is (protocol.md §2.5b).
-3. **Parameter model — kelvin end-to-end.** `colorTemp(n, k)`, console `ct <2700-6000>`, `{"ct":<kelvin>}`, and `believed_state.ct` are all kelvin now; `believed_state` keeps its `mode` (colour | white) flag + `ct`/`rgb` values. The UI slider (P2.10) sends/reads kelvin. The fine kelvin→byte mid-curve (LUT) stays Phase 5 (P5.2).
+3. **Parameter model — kelvin end-to-end.** `colorTemp(n, k)`, console `ct <2700-6000>`, `{"ct":<kelvin>}`, and `believed_state.ct` are all kelvin now; `believed_state` keeps its `mode` (colour | white) flag + `ct`/`rgb` values. The UI slider (P2.10) sends/reads kelvin. The fine kelvin→byte mid-curve (LUT) stays Phase 5 (P4.2).
 4. **`d[2]` = `0xff`** — adopted in both `colorTemp` and `rgb` (matches the air).
 5. **Reclaim first — moot.** `70:e7…` is already on our key (C.4); verify the new encoding on it directly.

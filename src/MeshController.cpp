@@ -651,9 +651,11 @@ void MeshController::loop()
   {
     scanRequested_ = false;
     isScanning_ = true;
+    fireScanState(true);    // bridge: publish hub state NOW (HA "Scan"=scanning) — the scan
     LOGF("Re-running discovery");
-    addLights(scanSeconds_);
+    addLights(scanSeconds_); // blocks the loop ~N s, so this must precede it
     isScanning_ = false;
+    fireScanState(false);   // bridge: publish hub state (HA "Scan"=idle) on completion
     LOGF("Discovery complete");
   }
   saveStateIfDirty(); // FR-05: persist believed state (debounced; no-op when clean)

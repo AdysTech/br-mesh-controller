@@ -23,7 +23,7 @@ export const api = {
   status: () => j('/api/status'),
   lights: () => j('/api/lights'),
 
-  scan: (seconds) => j('/api/scan', json({ seconds })),
+  scan: () => j('/api/scan', json({})),
   scanStop: () => j('/api/scan/stop'),
   raw: (sec, mode = 'active') => j('/api/raw', json({ sec, mode })),
 

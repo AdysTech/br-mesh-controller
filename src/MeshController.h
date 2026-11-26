@@ -129,6 +129,11 @@ class MeshController {
   /// Forgotten (FR-12) — the bridge purges the bulb's discovery (empty retained
   /// payload on the config topic) so HA drops the device.
   void setOnForgotten(std::function<void(uint8_t)> cb) { onForgotten_ = std::move(cb); }
+  /// Scan state flipped (true = a discovery/keying scan just started, false = it
+  /// just ended). The bridge re-publishes the hub state so the HA "Scan" sensor
+  /// tracks it live — isScanning_ is only true DURING the (blocking) scan, which
+  /// the periodic hub-state publish can't land within.
+  void setOnScanState(std::function<void(bool)> cb) { onScanState_ = std::move(cb); }
 
  private:
   // --- control plumbing ---
@@ -152,6 +157,7 @@ class MeshController {
   // --- persistence plumbing ---
   void loadKeyOrGenerate();
   void fireRegistered(LightDevice& l) { if (onRegistered_) onRegistered_(l); }
+  void fireScanState(bool scanning) { if (onScanState_) onScanState_(scanning); }
 
   // --- believed state (FR-05) + convergence (FR-16) ------------------------
   /// Persist a dirty believed-state (debounced — called from loop()).
@@ -189,6 +195,7 @@ class MeshController {
   std::function<void(LightDevice&)> onRegistered_;
   std::function<void(uint8_t)>      onRenamed_;
   std::function<void(uint8_t)>      onForgotten_;
+  std::function<void(bool)>         onScanState_;
 
   // --- command queue (P3.9, BRIDGE_PLAN §8) --------------------------------
   // Bounded FIFO of light NUMBERS; latest-wins per light (re-enqueue moves it

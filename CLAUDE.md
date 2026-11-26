@@ -98,7 +98,7 @@ ever lost: **reboot + `scan`** re-keys/re-confirms it (protocol.md §2.9).
 ```
 list                  known lights            key                   current mesh key
 sel <n>               target light            on/off/br/ct/rgb ... control (see protocol.md §2.5)
-scan [sec=5]          discovery + key new bulbs (use 12+ with a mid-scan power-cycle)
+scan [sec]            discovery + key new bulbs (default = the configured window; set it in Config → Discovery or `set scandur N`)
 raw [sec]             unfiltered per-frame hex dump (debug)
 rawwake [sec]         WAKE broadcast + every frame (proved WAKE triggers identity)
 prov                  clear saved WiFi creds + reboot into Improv provisioning

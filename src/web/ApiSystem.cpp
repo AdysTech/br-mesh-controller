@@ -27,32 +27,21 @@ void setDeviceName(const char* name);   // app shell (main.cpp)
 // ----------------------------------------------------------------------------
 static esp_err_t apiConfigGetHandler(httpd_req_t *req) {
   const Settings s = loadSettings();
-  char buf[768];
-  int n = snprintf(buf, sizeof(buf),
-      "{\"name\":\"%s\","
-      "\"ssid\":\"%s\","
-      "\"pass\":\"%s\","
-      "\"mhost\":\"%s\","
-      "\"mport\":%u,"
-      "\"muser\":\"%s\","
-      "\"mpass\":\"%s\","
-      "\"mclient\":\"%s\","
-      "\"mqtt_client\":\"%s\","
-      "\"mname\":\"%s\","
-      "\"ctrl_id\":\"%s\"}",
-      jsonEscape(s.name.c_str()).c_str(),
-      jsonEscape(s.ssid.c_str()).c_str(),
-      s.pass.empty() ? "" : "****",
-      jsonEscape(s.mqttHost.c_str()).c_str(),
-      (unsigned)s.mqttPort,
-      jsonEscape(s.mqttUser.c_str()).c_str(),
-      s.mqttPass.empty() ? "" : "****",
-      jsonEscape(s.mqttClient.c_str()).c_str(),
-      jsonEscape(g_bridge.clientId().c_str()).c_str(),
-      jsonEscape(s.mqttName.c_str()).c_str(),
-      g_bridge.ctrlId().empty() ? "" : g_bridge.ctrlId().c_str());
-  if (n <= 0) { apiSendError(req, 500, "config build failed"); return ESP_FAIL; }
-  apiSendJson(req, 200, buf);
+  cJSON *o = cJSON_CreateObject();
+  if (!o) { apiSendError(req, 500, "config build failed"); return ESP_FAIL; }
+  cJSON_AddStringToObject(o, "name", s.name.c_str());
+  cJSON_AddStringToObject(o, "ssid", s.ssid.c_str());
+  cJSON_AddStringToObject(o, "pass", s.pass.empty() ? "" : "****");
+  cJSON_AddStringToObject(o, "mhost", s.mqttHost.c_str());
+  cJSON_AddNumberToObject(o, "mport", (int)s.mqttPort);
+  cJSON_AddStringToObject(o, "muser", s.mqttUser.c_str());
+  cJSON_AddStringToObject(o, "mpass", s.mqttPass.empty() ? "" : "****");
+  cJSON_AddStringToObject(o, "mclient", s.mqttClient.c_str());
+  cJSON_AddStringToObject(o, "mqtt_client", g_bridge.clientId().c_str());
+  cJSON_AddStringToObject(o, "mname", s.mqttName.c_str());
+  cJSON_AddNumberToObject(o, "scandur", (int)s.scanSec);
+  cJSON_AddStringToObject(o, "ctrl_id", g_bridge.ctrlId().c_str());
+  apiSendCJson(req, 200, o);
   return ESP_OK;
 }
 
@@ -129,22 +118,28 @@ static esp_err_t apiConfigPostHandler(httpd_req_t *req) {
       mqttTouched = true;
     }
   }
+  // scandur: discovery window (seconds). No reboot — read live on each scan.
+  // Absent (apiJsonInt -> -1) means "leave it". Clamp to a sane range.
+  {
+    int sd = apiJsonInt(body, "scandur");
+    if (sd >= 1 && sd <= 600) s.scanSec = sd;
+  }
 
   saveSettings(s);
   if (mqttTouched) g_bridge.updateSettings(s);
   if (apiJsonString(body, "name") == s.name)
     setDeviceName(s.name.c_str());   // persist + apply to the live netif
 
-  char buf[160];
   // A broker change (host/port/user/pass/client/name) also needs a reboot:
   // esp-mqtt bakes the broker address+creds into the client at init, so it only
   // takes effect from the next boot. Flag that too, not just a WiFi change.
   const bool rebootNeeded = wifiTouched || mqttTouched;
-  int n = snprintf(buf, sizeof(buf),
-                   "{\"saved\":true,\"reboot_needed\":%s,\"name\":\"%s\"}",
-                   rebootNeeded ? "true" : "false",
-                   jsonEscape(s.name.c_str()).c_str());
-  apiSendJson(req, 200, buf);
+  cJSON *o = cJSON_CreateObject();
+  if (!o) { apiSendError(req, 500, "config build failed"); return ESP_FAIL; }
+  cJSON_AddBoolToObject(o, "saved", true);
+  cJSON_AddBoolToObject(o, "reboot_needed", rebootNeeded);
+  cJSON_AddStringToObject(o, "name", s.name.c_str());
+  apiSendCJson(req, 200, o);
   return ESP_OK;
 }
 
@@ -154,7 +149,10 @@ static esp_err_t apiConfigPostHandler(httpd_req_t *req) {
 //  happens after the send (it ends in ESP.restart()).
 // ----------------------------------------------------------------------------
 static esp_err_t apiProvisionHandler(httpd_req_t *req) {
-  apiSendJson(req, 200, "{\"rebooting\":true,\"into\":\"improv\"}");
+  cJSON *o = cJSON_CreateObject();
+  cJSON_AddBoolToObject(o, "rebooting", true);
+  cJSON_AddStringToObject(o, "into", "improv");
+  apiSendCJson(req, 200, o);
   vTaskDelay(pdMS_TO_TICKS(150));   // let the response flush
   requestProvisioning();            // no return
   return ESP_OK;
@@ -170,7 +168,9 @@ static esp_err_t apiProvisionHandler(httpd_req_t *req) {
 //  fix closes).
 // ----------------------------------------------------------------------------
 static esp_err_t apiFactoryResetHandler(httpd_req_t *req) {
-  apiSendJson(req, 200, "{\"resetting\":true}");
+  cJSON *o = cJSON_CreateObject();
+  cJSON_AddBoolToObject(o, "resetting", true);
+  apiSendCJson(req, 200, o);
   vTaskDelay(pdMS_TO_TICKS(150));
 
   const Settings kept = loadSettings();   // capture creds + name + MQTT first
@@ -196,47 +196,16 @@ static esp_err_t apiFactoryResetHandler(httpd_req_t *req) {
 //
 //  GET  /api/backup  -> the JSON snapshot (download)
 //  POST /api/restore  <- that JSON; overwrites settings + key + lights, reboots
-// ----------------------------------------------------------------------------
-// Append one flat "prefixsuffix":"value" entry (string) into a heap-backed
-// String — no fixed intermediate buffer, so long values (name, mac, id) are
-// never truncated. `val` is JSON-escaped.
-static void kvString(String &out, const char *prefix, const char *suffix, const char *val) {
-  out.concat(",\""); out.concat(prefix); out.concat(suffix);
-  out.concat("\":\""); out.concat(jsonEscape(val).c_str()); out.concat("\"");
-}
-static void kvInt(String &out, const char *prefix, const char *suffix, int val) {
-  out.concat(",\""); out.concat(prefix); out.concat(suffix);
-  out.concat("\":"); out.concat(val);
-}
-
-// Serialize one light's fields as flat "l<N>_<field>" entries into `out`.
-static void appendLightJson(String &out, int i, const LightDevice &l) {
-  char key[8];
-  snprintf(key, sizeof(key), "l%d_", i);
-
-  kvInt(out, key, "num", l.number);
-  kvString(out, key, "id", l.id.c_str());
-  kvString(out, key, "nm", l.name.c_str());
-  kvString(out, key, "mac", l.address.c_str());
-  char type[8];
-  snprintf(type, sizeof(type), "%02x%02x", l.type[0], l.type[1]);
-  kvString(out, key, "type", type);
-  kvInt(out, key, "on", l.on ? 1 : 0);
-  kvInt(out, key, "bri", l.brightness);
-  kvInt(out, key, "r", l.rgbR);
-  kvInt(out, key, "g", l.rgbG);
-  kvInt(out, key, "b", l.rgbB);
-  kvInt(out, key, "ct", l.ct);
-  kvInt(out, key, "cm", l.colorMode);
-}
-
-// ----------------------------------------------------------------------------
-//  GET /api/backup — the flat snapshot. Schema (all top-level keys quoted, so
+//
+//  GET /api/backup — the flat snapshot. Schema (all top-level keys flat, so
 //  the restore-side apiJson* readers find them unambiguously):
 //    v:1  fw  board  key:<8 hex>  ln:<n>
 //    s_name s_ssid s_pass s_mhost s_mport s_muser s_mpass s_mclient s_mname
+//    s_scandur
 //    per light i: l<i>_num l<i>_id l<i>_nm l<i>_mac l<i>_type l<i>_on
 //                 l<i>_bri l<i>_r l<i>_g l<i>_b l<i>_ct l<i>_cm
+//  Built as a flat cJSON object (same shape) — cJSON owns the escaping; the
+//  restore side still reads it back with the tiny apiJson* readers.
 // ----------------------------------------------------------------------------
 static esp_err_t apiBackupHandler(httpd_req_t *req) {
   if (!g_mesh.started()) { apiSendError(req, 503, "engine offline (provisioning mode)"); return ESP_FAIL; }
@@ -244,32 +213,50 @@ static esp_err_t apiBackupHandler(httpd_req_t *req) {
   const uint8_t *k = g_mesh.key();
   const std::vector<LightDevice> &lights = g_mesh.lights();
 
-  String out;
-  out.concat("{\"v\":1");   // kv*() below each prepend their own leading comma
-  kvString(out, "", "fw", FIRMWARE_VERSION);
-  kvString(out, "", "board", kBoardModel);
+  cJSON *o = cJSON_CreateObject();
+  if (!o) { apiSendError(req, 500, "backup build failed"); return ESP_FAIL; }
+  cJSON_AddNumberToObject(o, "v", 1);
+  cJSON_AddStringToObject(o, "fw", FIRMWARE_VERSION);
+  cJSON_AddStringToObject(o, "board", kBoardModel);
   char keyHex[16];
   snprintf(keyHex, sizeof(keyHex), "%02x%02x%02x%02x", k[0], k[1], k[2], k[3]);
-  kvString(out, "", "key", keyHex);
-  kvInt(out, "", "ln", (int)lights.size());
+  cJSON_AddStringToObject(o, "key", keyHex);
+  cJSON_AddNumberToObject(o, "ln", (int)lights.size());
 
   // settings (empty values serialize as "" — a restore of a fresh board's
   // backup is a no-op for any unset field).
-  kvString(out, "s_", "name", s.name.c_str());
-  kvString(out, "s_", "ssid", s.ssid.c_str());
-  kvString(out, "s_", "pass", s.pass.c_str());
-  kvString(out, "s_", "mhost", s.mqttHost.c_str());
-  kvInt(out, "s_", "mport", (int)s.mqttPort);
-  kvString(out, "s_", "muser", s.mqttUser.c_str());
-  kvString(out, "s_", "mpass", s.mqttPass.c_str());
-  kvString(out, "s_", "mclient", s.mqttClient.c_str());
-  kvString(out, "s_", "mname", s.mqttName.c_str());
+  cJSON_AddStringToObject(o, "s_name", s.name.c_str());
+  cJSON_AddStringToObject(o, "s_ssid", s.ssid.c_str());
+  cJSON_AddStringToObject(o, "s_pass", s.pass.c_str());
+  cJSON_AddStringToObject(o, "s_mhost", s.mqttHost.c_str());
+  cJSON_AddNumberToObject(o, "s_mport", (int)s.mqttPort);
+  cJSON_AddStringToObject(o, "s_muser", s.mqttUser.c_str());
+  cJSON_AddStringToObject(o, "s_mpass", s.mqttPass.c_str());
+  cJSON_AddStringToObject(o, "s_mclient", s.mqttClient.c_str());
+  cJSON_AddStringToObject(o, "s_mname", s.mqttName.c_str());
+  cJSON_AddNumberToObject(o, "s_scandur", (int)s.scanSec);
 
-  for (int i = 0; i < (int)lights.size(); i++)
-    appendLightJson(out, i, lights[i]);
-  out.concat("}");
-
-  apiSendJson(req, 200, out.c_str());
+  // per light: flat "l<i>_<field>" keys (the restore side reads them back).
+  for (int i = 0; i < (int)lights.size(); i++) {
+    const LightDevice &l = lights[i];
+    char key[8];
+    snprintf(key, sizeof(key), "l%d_", i);
+    cJSON_AddNumberToObject(o, (String(key) + "num").c_str(), (int)l.number);
+    cJSON_AddStringToObject(o, (String(key) + "id").c_str(), l.id.c_str());
+    cJSON_AddStringToObject(o, (String(key) + "nm").c_str(), l.name.c_str());
+    cJSON_AddStringToObject(o, (String(key) + "mac").c_str(), l.address.c_str());
+    char type[8];
+    snprintf(type, sizeof(type), "%02x%02x", l.type[0], l.type[1]);
+    cJSON_AddStringToObject(o, (String(key) + "type").c_str(), type);
+    cJSON_AddNumberToObject(o, (String(key) + "on").c_str(), l.on ? 1 : 0);
+    cJSON_AddNumberToObject(o, (String(key) + "bri").c_str(), (int)l.brightness);
+    cJSON_AddNumberToObject(o, (String(key) + "r").c_str(), (int)l.rgbR);
+    cJSON_AddNumberToObject(o, (String(key) + "g").c_str(), (int)l.rgbG);
+    cJSON_AddNumberToObject(o, (String(key) + "b").c_str(), (int)l.rgbB);
+    cJSON_AddNumberToObject(o, (String(key) + "ct").c_str(), (int)l.ct);
+    cJSON_AddNumberToObject(o, (String(key) + "cm").c_str(), (int)l.colorMode);
+  }
+  apiSendCJson(req, 200, o);
   return ESP_OK;
 }
 
@@ -319,6 +306,8 @@ static esp_err_t apiRestoreHandler(httpd_req_t *req) {
   s.mqttPass   = apiJsonString(body, "s_mpass");
   s.mqttClient = apiJsonString(body, "s_mclient");
   s.mqttName   = apiJsonString(body, "s_mname");
+  s.scanSec    = apiJsonInt(body, "s_scandur");
+  if (s.scanSec < 1 || s.scanSec > 600) s.scanSec = SCAN_DURATION;
 
   std::vector<LightDevice> lights;
   lights.reserve(ln);
@@ -346,7 +335,11 @@ static esp_err_t apiRestoreHandler(httpd_req_t *req) {
     lights.push_back(l);
   }
 
-  apiSendJson(req, 200, (String("{\"restored\":true,\"lights\":") + ln + "}").c_str());
+  cJSON *o = cJSON_CreateObject();
+  if (!o) { apiSendError(req, 500, "restore build failed"); return ESP_FAIL; }
+  cJSON_AddBoolToObject(o, "restored", true);
+  cJSON_AddNumberToObject(o, "lights", ln);
+  apiSendCJson(req, 200, o);
   vTaskDelay(pdMS_TO_TICKS(150));   // let the response flush
   saveSettings(s);
   g_mesh.restoreKey(key);
@@ -382,9 +375,11 @@ static esp_err_t apiRawPostHandler(httpd_req_t *req) {
   else if (mode == "passive") g_mesh.rawPassive(sec);
   else g_mesh.raw(sec);
 
-  char buf[96];
-  int n = snprintf(buf, sizeof(buf), "{\"capture\":\"%s\",\"sec\":%d}", mode.c_str(), sec);
-  apiSendJson(req, 202, buf);
+  cJSON *o = cJSON_CreateObject();
+  if (!o) { apiSendError(req, 500, "raw build failed"); return ESP_FAIL; }
+  cJSON_AddStringToObject(o, "capture", mode.c_str());
+  cJSON_AddNumberToObject(o, "sec", sec);
+  apiSendCJson(req, 202, o);
   return ESP_OK;
 }
 

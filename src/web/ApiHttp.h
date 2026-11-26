@@ -2,10 +2,15 @@
 // Small JSON/HTTP helpers for the esp_http_server handlers.
 #include <Arduino.h>
 #include <esp_http_server.h>
+#include <cJSON.h>    // the response builders emit cJSON trees (see below)
 #include <string>
 
-/// Send a JSON string with Content-Type + cache-busting headers.
-void apiSendJson(httpd_req_t *req, int httpCode, const char *jsonStr);
+/// Serialize a fully-built cJSON tree and send it as the JSON response, honoring
+/// httpCode. Owns the tree's lifetime (frees the print buffer + the tree).
+/// Handlers build the tree with cJSON_Add*...; this is the only place it becomes
+/// a wire string, so there is no fixed response buffer to overflow and no manual
+/// escaping — cJSON owns both.
+void apiSendCJson(httpd_req_t *req, int httpCode, cJSON *obj);
 
 /// Send a JSON error object {"error": "msg"}.
 void apiSendError(httpd_req_t *req, int httpCode, const char *msg);

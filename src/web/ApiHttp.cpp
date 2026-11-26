@@ -1,26 +1,47 @@
 // JSON/HTTP helpers (see ApiHttp.h).
 #include "ApiHttp.h"
 #include <cstdio>
+#include <cJSON.h>
 
-void apiSendJson(httpd_req_t *req, int httpCode, const char *jsonStr) {
+/// Map an HTTP status code to the reason phrase httpd wants on the status line
+/// (defaults to 200 OK for anything we don't special-case).
+static const char *httpReason(int code) {
+  switch (code) {
+    case 200: return "200 OK";
+    case 202: return "202 Accepted";
+    case 400: return "400 Bad Request";
+    case 404: return "404 Not Found";
+    case 409: return "409 Conflict";
+    case 500: return "500 Internal Server Error";
+    case 503: return "503 Service Unavailable";
+    default:  return "200 OK";
+  }
+}
+
+void apiSendCJson(httpd_req_t *req, int httpCode, cJSON *obj) {
+  char *s = obj ? cJSON_PrintUnformatted(obj) : nullptr;
+  if (!s) {   // print failed (heap pressure) — minimal body, no recursion back
+    if (obj) cJSON_Delete(obj);               // into apiSendError (would loop)
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, "{\"error\":\"json build failed\"}", HTTPD_RESP_USE_STRLEN);
+    return;
+  }
   httpd_resp_set_type(req, "application/json");
   httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
   httpd_resp_set_hdr(req, "Cache-Control", "no-store, no-cache, must-revalidate");
   httpd_resp_set_hdr(req, "Pragma", "no-cache");
   httpd_resp_set_hdr(req, "Expires", "0");
-  httpd_resp_send(req, jsonStr, HTTPD_RESP_USE_STRLEN);
-  (void)httpCode;  // httpd_resp_send sets 200; errors use apiSendError
+  httpd_resp_set_status(req, httpReason(httpCode ? httpCode : 200));
+  httpd_resp_send(req, s, HTTPD_RESP_USE_STRLEN);
+  cJSON_free(s);
+  cJSON_Delete(obj);
 }
 
 void apiSendError(httpd_req_t *req, int httpCode, const char *msg) {
-  char buf[192];
-  char status[32];
-  int n = snprintf(buf, sizeof(buf), "{\"error\":\"%s\"}", msg ? msg : "error");
-  snprintf(status, sizeof(status), "%d Error", httpCode ? httpCode : 500);
-  httpd_resp_set_type(req, "application/json");
-  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-  httpd_resp_set_status(req, status);
-  httpd_resp_send(req, buf, n);
+  cJSON *o = cJSON_CreateObject();
+  if (!o) return;
+  cJSON_AddStringToObject(o, "error", msg ? msg : "error");
+  apiSendCJson(req, httpCode, o);
 }
 
 String apiReadBody(httpd_req_t *req, size_t cap) {
